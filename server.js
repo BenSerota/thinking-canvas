@@ -73,7 +73,7 @@ function buildMessages(message, history) {
     for (const msg of recent) {
       messages.push({
         role: msg.role === 'user' ? 'user' : 'assistant',
-        content: msg.text,
+        content: msg.content || msg.text,
       });
     }
   }
@@ -118,10 +118,16 @@ app.post('/api/chat/stream', async (req, res) => {
     });
 
     stream.on('error', (err) => {
+      if (err.name === 'APIUserAbortError') {
+        // Client disconnected, nothing to do
+        return;
+      }
       console.error('Anthropic stream error:', err.message);
-      res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error communicating with Claude API.' })}\n\n`);
-      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-      res.end();
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error communicating with Claude API.' })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+        res.end();
+      }
     });
 
     stream.on('end', () => {
