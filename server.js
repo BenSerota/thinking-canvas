@@ -103,45 +103,39 @@ app.post('/api/chat/stream', async (req, res) => {
   const concepts = extractConcepts(message);
   res.write(`data: ${JSON.stringify({ type: 'concepts', concepts })}\n\n`);
 
-  try {
-    const messages = buildMessages(message, history);
+  const messages = buildMessages(message, history);
+  let aborted = false;
 
-    const stream = anthropic.messages.stream({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages,
-    });
+  const stream = anthropic.messages.stream({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1024,
+    system: SYSTEM_PROMPT,
+    messages,
+  });
 
-    stream.on('text', (text) => {
+  stream.on('text', (text) => {
+    if (!aborted && !res.writableEnded) {
       res.write(`data: ${JSON.stringify({ type: 'text', text })}\n\n`);
-    });
+    }
+  });
 
-    stream.on('error', (err) => {
-      if (err.name === 'APIUserAbortError') {
-        // Client disconnected, nothing to do
-        return;
-      }
-      console.error('Anthropic stream error:', err.message);
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error communicating with Claude API.' })}\n\n`);
-        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-        res.end();
-      }
-    });
+  // Handle client disconnect
+  req.on('close', () => {
+    aborted = true;
+    stream.abort();
+  });
 
-    stream.on('end', () => {
-      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-      res.end();
-    });
-
-    // Handle client disconnect
-    req.on('close', () => {
-      stream.abort();
-    });
+  try {
+    await stream.finalMessage();
   } catch (err) {
-    console.error('Failed to create stream:', err.message);
-    res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error: Could not connect to Claude API. Check your ANTHROPIC_API_KEY.' })}\n\n`);
+    if (err.name === 'APIUserAbortError') {
+      // Client disconnected, nothing to do
+      return;
+    }
+    console.error('Anthropic stream error:', err.message);
+  }
+
+  if (!res.writableEnded) {
     res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
     res.end();
   }
