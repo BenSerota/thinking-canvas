@@ -1,9 +1,11 @@
 const express = require('express');
 const path = require('path');
-const { spawn } = require('child_process');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+const anthropic = new Anthropic();
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -61,31 +63,32 @@ function extractConcepts(message) {
 }
 
 /**
- * Build a prompt string that includes conversation history.
+ * Build messages array from conversation history for the Anthropic API.
  */
-function buildPrompt(message, history) {
-  if (!history || history.length === 0) {
-    return message;
+function buildMessages(message, history) {
+  const messages = [];
+
+  if (history && history.length > 0) {
+    const recent = history.slice(-10);
+    for (const msg of recent) {
+      messages.push({
+        role: msg.role === 'user' ? 'user' : 'assistant',
+        content: msg.text,
+      });
+    }
   }
 
-  // Include recent history for context (last 10 messages max)
-  const recent = history.slice(-10);
-  const lines = recent.map(msg => {
-    const role = msg.role === 'user' ? 'User' : 'Assistant';
-    return `${role}: ${msg.text}`;
-  });
-
-  lines.push(`User: ${message}`);
-  return lines.join('\n');
+  messages.push({ role: 'user', content: message });
+  return messages;
 }
 
 const SYSTEM_PROMPT = `You are a friendly, conversational AI assistant called Thinking Canvas. You're embedded in a visual interface where particles on a canvas form shapes related to the conversation topic. Keep your responses concise but helpful (2-4 sentences typically). Be warm and engaging.`;
 
 /**
  * POST /api/chat/stream
- * Streams real Claude responses via the claude CLI subprocess.
+ * Streams responses via the Anthropic SDK.
  */
-app.post('/api/chat/stream', (req, res) => {
+app.post('/api/chat/stream', async (req, res) => {
   const { message, history } = req.body;
 
   if (!message) {
@@ -100,115 +103,48 @@ app.post('/api/chat/stream', (req, res) => {
   const concepts = extractConcepts(message);
   res.write(`data: ${JSON.stringify({ type: 'concepts', concepts })}\n\n`);
 
-  const prompt = buildPrompt(message, history);
+  try {
+    const messages = buildMessages(message, history);
 
-  // Build env without CLAUDECODE to allow nested invocation
-  const childEnv = { ...process.env };
-  delete childEnv.CLAUDECODE;
+    const stream = anthropic.messages.stream({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: SYSTEM_PROMPT,
+      messages,
+    });
 
-  const child = spawn('claude', [
-    '-p', prompt,
-    '--output-format', 'stream-json',
-    '--system-prompt', SYSTEM_PROMPT,
-    '--verbose',
-  ], {
-    env: childEnv,
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
+    stream.on('text', (text) => {
+      res.write(`data: ${JSON.stringify({ type: 'text', text })}\n\n`);
+    });
 
-  // Close stdin immediately since we passed the prompt via -p
-  child.stdin.end();
+    stream.on('error', (err) => {
+      console.error('Anthropic stream error:', err.message);
+      res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error communicating with Claude API.' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.end();
+    });
 
-  let buffer = '';
-  let hasStreamedText = false;
+    stream.on('end', () => {
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.end();
+    });
 
-  child.stdout.on('data', (chunk) => {
-    buffer += chunk.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // Keep incomplete line in buffer
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const data = JSON.parse(line);
-
-        // stream-json format wraps events in { type: "stream_event", event: {...} }
-        if (data.type === 'stream_event' && data.event) {
-          const evt = data.event;
-          if (evt.type === 'content_block_delta' && evt.delta && evt.delta.type === 'text_delta') {
-            hasStreamedText = true;
-            res.write(`data: ${JSON.stringify({ type: 'text', text: evt.delta.text })}\n\n`);
-          }
-        }
-        // Also handle "assistant" message type (complete message, non-streaming fallback)
-        else if (data.type === 'assistant' && data.message) {
-          // data.message is an object with content array
-          const content = data.message.content || [];
-          for (const block of content) {
-            if (block.type === 'text' && block.text && !hasStreamedText) {
-              res.write(`data: ${JSON.stringify({ type: 'text', text: block.text })}\n\n`);
-              hasStreamedText = true;
-            }
-          }
-        }
-        // Handle "result" type as final fallback
-        else if (data.type === 'result' && data.result && !hasStreamedText) {
-          res.write(`data: ${JSON.stringify({ type: 'text', text: data.result })}\n\n`);
-          hasStreamedText = true;
-        }
-      } catch (e) {
-        // Not valid JSON, skip
-      }
-    }
-  });
-
-  child.stderr.on('data', (chunk) => {
-    console.error('Claude CLI stderr:', chunk.toString());
-  });
-
-  child.on('close', (code) => {
-    // Process any remaining buffer
-    if (buffer.trim()) {
-      try {
-        const data = JSON.parse(buffer);
-        if (data.type === 'stream_event' && data.event) {
-          const evt = data.event;
-          if (evt.type === 'content_block_delta' && evt.delta && evt.delta.type === 'text_delta') {
-            res.write(`data: ${JSON.stringify({ type: 'text', text: evt.delta.text })}\n\n`);
-          }
-        } else if (data.type === 'result' && data.result && !hasStreamedText) {
-          res.write(`data: ${JSON.stringify({ type: 'text', text: data.result })}\n\n`);
-        }
-      } catch (e) {
-        // ignore
-      }
-    }
-
-    if (code !== 0 && !hasStreamedText) {
-      res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error: Claude CLI exited with code ' + code + '. Make sure "claude" is installed and authenticated. Run "claude" in your terminal to set up.' })}\n\n`);
-    }
-
+    // Handle client disconnect
+    req.on('close', () => {
+      stream.abort();
+    });
+  } catch (err) {
+    console.error('Failed to create stream:', err.message);
+    res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error: Could not connect to Claude API. Check your ANTHROPIC_API_KEY.' })}\n\n`);
     res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
     res.end();
-  });
-
-  child.on('error', (err) => {
-    console.error('Failed to start Claude CLI:', err.message);
-    res.write(`data: ${JSON.stringify({ type: 'text', text: 'Error: Could not start the "claude" CLI. Make sure Claude Code is installed. Visit https://docs.anthropic.com/en/docs/claude-code to install it.' })}\n\n`);
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-    res.end();
-  });
-
-  // Handle client disconnect
-  req.on('close', () => {
-    child.kill();
-  });
+  }
 });
 
 /**
  * POST /api/chat (non-streaming fallback)
  */
-app.post('/api/chat', (req, res) => {
+app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body;
 
   if (!message) {
@@ -216,49 +152,30 @@ app.post('/api/chat', (req, res) => {
   }
 
   const concepts = extractConcepts(message);
-  const prompt = buildPrompt(message, history);
 
-  const childEnv2 = { ...process.env };
-  delete childEnv2.CLAUDECODE;
+  try {
+    const messages = buildMessages(message, history);
 
-  const child = spawn('claude', [
-    '-p', prompt,
-    '--output-format', 'json',
-    '--system-prompt', SYSTEM_PROMPT,
-  ], {
-    env: childEnv2,
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-
-  child.stdin.end();
-
-  let stdout = '';
-  let stderr = '';
-
-  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-
-  child.on('close', (code) => {
-    if (code !== 0) {
-      return res.status(500).json({
-        text: 'Error: Claude CLI failed. Make sure "claude" is installed and authenticated.',
-        concepts: ['question']
-      });
-    }
-    try {
-      const data = JSON.parse(stdout);
-      res.json({ text: data.result || stdout, concepts });
-    } catch {
-      res.json({ text: stdout.trim(), concepts });
-    }
-  });
-
-  child.on('error', () => {
-    res.status(500).json({
-      text: 'Error: Could not start "claude" CLI. Install Claude Code first.',
-      concepts: ['question']
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: SYSTEM_PROMPT,
+      messages,
     });
-  });
+
+    const text = response.content
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('');
+
+    res.json({ text, concepts });
+  } catch (err) {
+    console.error('Anthropic API error:', err.message);
+    res.status(500).json({
+      text: 'Error: Could not get response from Claude API. Check your ANTHROPIC_API_KEY.',
+      concepts: ['question'],
+    });
+  }
 });
 
 app.listen(PORT, () => {
