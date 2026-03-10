@@ -1,0 +1,12 @@
+{
+  "name": "thinking-canvas",
+  "version": "0.1.0",
+  "description": "AI conversation interface with particle-based thinking visualization",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
