@@ -98,6 +98,8 @@ app.post('/api/chat/stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
 
   // Send concepts immediately based on the user's message
   const concepts = extractConcepts(message);
@@ -128,11 +130,14 @@ app.post('/api/chat/stream', async (req, res) => {
   try {
     await stream.finalMessage();
   } catch (err) {
-    if (err.name === 'APIUserAbortError') {
-      // Client disconnected, nothing to do
+    if (aborted || err.name === 'APIUserAbortError' || err.message?.includes('aborted')) {
+      console.log('Stream aborted (client disconnected)');
       return;
     }
-    console.error('Anthropic stream error:', err.message);
+    console.error('Anthropic API error:', err.name, err.message, err.status);
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ type: 'text', text: `API error: ${err.message}` })}\n\n`);
+    }
   }
 
   if (!res.writableEnded) {
