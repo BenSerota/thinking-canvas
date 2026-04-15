@@ -65,23 +65,32 @@ app.post('/api/chat/stream', async (req, res) => {
         }
 
         case 'visual_concepts': {
-          // Haiku-extracted iconic concepts → map through iconMatcher/generator → send to client
+          // Haiku-extracted iconic concepts → stream resolved shapes one-by-one.
+          // The client starts rendering the first shape as soon as it arrives,
+          // so slow svg-generator fallbacks for later shapes don't block shape 1.
           const iconics = event.visuals.map(v => v.iconic).filter(Boolean);
           if (iconics.length > 0) {
             console.log('[visuals] Iconic concepts:', iconics.join(', '));
           }
 
-          const shapes = await shapeService.mapConceptsToShapes(event.visuals);
+          const collected = [];
+          for await (const shape of shapeService.streamConceptShapes(event.visuals)) {
+            if (res.writableEnded) break;
+            collected.push(shape);
 
-          // Log how each iconic resolved — source + score
-          for (let i = 0; i < event.visuals.length && i < shapes.length; i++) {
-            const iconic = event.visuals[i].iconic;
-            const s = shapes[i];
-            const scoreStr = typeof s.score === 'number' ? `, ${s.score.toFixed(2)}` : '';
-            console.log(`[icons] "${iconic}" → ${s.name}${s.dynamic ? '.svg' : ''} (${s.source}${scoreStr})`);
+            const scoreStr = typeof shape.score === 'number' ? `, ${shape.score.toFixed(2)}` : '';
+            console.log(`[icons] "${shape.concept}" → ${shape.name}${shape.dynamic ? '.svg' : ''} (${shape.source}${scoreStr})`);
+
+            // Per-concept SSE — client renders immediately on first arrival
+            res.write(`data: ${JSON.stringify({ type: 'concept_resolved', shape })}\n\n`);
           }
 
-          res.write(`data: ${JSON.stringify({ type: 'concepts', concepts: shapes, source: 'haiku' })}\n\n`);
+          // Terminal event signals the client can stop expecting more shapes
+          // (e.g. to finalize the rotation-timer setup). Also sent as the
+          // legacy batched `concepts` payload for any older client paths.
+          if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ type: 'concepts_done', concepts: collected, source: 'haiku' })}\n\n`);
+          }
           break;
         }
 

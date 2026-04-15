@@ -82,8 +82,20 @@ class App {
               this.canvas.setState('thinking');
               break;
 
+            case 'concept_resolved':
+              // Per-shape streaming: render the FIRST arrival immediately so
+              // the canvas starts forming while shapes 2-3 are still resolving
+              // on the server (potentially including slow svg-generator calls).
+              if (data.shape) this._onConceptResolved(data.shape);
+              break;
+
+            case 'concepts_done':
+              // Terminal marker — all shapes have arrived. The rotation timer
+              // was started on the second arrival; nothing to do here.
+              break;
+
             case 'concepts':
-              // State 2 → 3: Haiku concepts arrived — form shapes
+              // Legacy batched payload — retained for any non-streaming path.
               this.canvas.interimMode = false;
               this._startConceptCycle(data.concepts || []);
               break;
@@ -111,7 +123,35 @@ class App {
   }
 
   /**
-   * Start cycling through shapes from concept events.
+   * Handle a single concept_resolved SSE event. Renders the first shape
+   * immediately, then appends later shapes and starts the 4-s rotation timer
+   * on the second arrival.
+   */
+  _onConceptResolved(shape) {
+    if (this.currentConcepts.length === 0) {
+      // First arrival — drop thinking state, render this shape now
+      this.canvas.interimMode = false;
+      this._clearConceptCycle();
+      this.currentConcepts = [shape];
+      this.conceptIndex = 0;
+      this._showCurrentConcept('instant');
+      return;
+    }
+
+    this.currentConcepts.push(shape);
+
+    // Start rotation timer the moment we have 2 shapes to cycle between
+    if (this.currentConcepts.length === 2 && !this.conceptTimer) {
+      this.conceptTimer = setInterval(() => {
+        this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
+        this._showCurrentConcept('crossfade');
+      }, 4000);
+    }
+  }
+
+  /**
+   * Start cycling through shapes from a batched concepts payload.
+   * Legacy path — the streaming path uses _onConceptResolved instead.
    */
   _startConceptCycle(shapeInfos) {
     this._clearConceptCycle();
@@ -155,7 +195,11 @@ class App {
     }
 
     if (points) {
-      this.canvas.setShape(points, info.name, transition);
+      // Label = Haiku's original iconic phrase (e.g. "basketball hoop") when
+      // available, falling back to the matched filename. This is what
+      // surfaces on the canvas as the small label at the bottom.
+      const label = info.concept || info.name;
+      this.canvas.setShape(points, label, transition);
     }
   }
 
@@ -164,6 +208,10 @@ class App {
       clearInterval(this.conceptTimer);
       this.conceptTimer = null;
     }
+    // Reset collected concepts so the first concept_resolved of the next
+    // message triggers the "first arrival" render path.
+    this.currentConcepts = [];
+    this.conceptIndex = 0;
   }
 }
 

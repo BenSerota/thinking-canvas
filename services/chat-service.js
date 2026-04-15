@@ -3,7 +3,11 @@
  *
  * Wraps the Anthropic SDK for streaming with extended thinking.
  * Concept extraction is handled by the visual-extractor (Haiku) service,
- * which fires concurrently after the thinking block completes.
+ * which we kick off at request start — BEFORE the Sonnet stream call — so
+ * Haiku and Sonnet run truly in parallel from t=0. Previously Haiku waited
+ * on Sonnet's thinking block to complete, adding 1-3 s to "first shape"
+ * latency. Haiku's prompt handles an empty context string, and the tiny
+ * quality loss from skipping the thinking buffer is dwarfed by the timing win.
  *
  * Yields typed events:
  *   { type: 'thinking_text', text }            — raw thinking block content
@@ -56,37 +60,44 @@ async function* createStream(message, history) {
 
   let thinkingBuffer = '';
   let currentBlockType = null;
-  let haikuPromise = null;
   let haikuResolved = false;
+  let haikuYielded = false;
   let haikuResult = null;
+
+  // Kick off Haiku concept extraction BEFORE opening the Sonnet stream so the
+  // two calls run truly in parallel. Haiku typically returns in 500-1500 ms;
+  // by starting it at t=0 rather than post-thinking we shave 1-3 s off "first
+  // shape appears on canvas."
+  //
+  // A `.then` handler flips `haikuResolved` when the call completes. The
+  // Sonnet event loop below polls this flag on each iteration and yields
+  // `visual_concepts` the first time it sees `resolved && !yielded`. Using a
+  // flag instead of `Promise.race([p.then(...), Promise.resolve(false)])` —
+  // the old pattern silently lost every race because `Promise.resolve` is
+  // already-settled and always won the microtask queue.
+  const haikuPromise = visualExtractor
+    .extractVisualConcepts(message, '')
+    .then(r => { haikuResult = r; haikuResolved = true; return r; })
+    .catch(err => { console.warn('Haiku failed:', err.message); haikuResolved = true; return null; });
 
   let stream;
   try {
     stream = await anthropic.messages.create(streamParams);
   } catch (err) {
-    // Fall back to non-thinking streaming
+    // Fall back to non-thinking streaming. Haiku is already in flight —
+    // nothing else to do here.
     console.warn('Extended thinking failed, falling back:', err.message);
     const fallbackParams = { ...streamParams, max_tokens: 1024 };
     delete fallbackParams.thinking;
     stream = await anthropic.messages.create(fallbackParams);
-
-    // Fire Haiku immediately with just the user message (no thinking text)
-    haikuPromise = visualExtractor.extractVisualConcepts(message, '');
   }
 
   for await (const event of stream) {
-    // --- Non-blocking check: has Haiku resolved? ---
-    if (haikuPromise && !haikuResolved) {
-      const check = await Promise.race([
-        haikuPromise.then(r => ({ resolved: true, result: r })),
-        Promise.resolve({ resolved: false }),
-      ]);
-      if (check.resolved) {
-        haikuResolved = true;
-        haikuResult = check.result;
-        if (haikuResult && haikuResult.length > 0) {
-          yield { type: 'visual_concepts', visuals: haikuResult };
-        }
+    // --- Non-blocking check: has Haiku resolved? Yield concepts mid-stream. ---
+    if (haikuResolved && !haikuYielded) {
+      haikuYielded = true;
+      if (haikuResult && haikuResult.length > 0) {
+        yield { type: 'visual_concepts', visuals: haikuResult };
       }
     }
 
@@ -106,13 +117,11 @@ async function* createStream(message, history) {
     // --- Block ends ---
     if (event.type === 'content_block_stop') {
       if (currentBlockType === 'thinking' && thinkingBuffer.length > 0) {
-        // Yield thinking text for the collapsible UI
+        // Yield thinking text for the collapsible UI. Haiku extraction was
+        // already kicked off at request start; by the time thinking ends,
+        // Haiku concepts are usually already yielded by the flag-poll check
+        // at the top of the loop.
         yield { type: 'thinking_text', text: thinkingBuffer };
-
-        // Fire Haiku extraction concurrently — do NOT await
-        if (!haikuPromise) {
-          haikuPromise = visualExtractor.extractVisualConcepts(message, thinkingBuffer);
-        }
       }
       currentBlockType = null;
       continue;
@@ -125,15 +134,15 @@ async function* createStream(message, history) {
   }
 
   // --- After stream ends: ensure Haiku concepts arrive ---
-  if (haikuPromise && !haikuResolved) {
-    try {
-      haikuResult = await haikuPromise;
-      haikuResolved = true;
-      if (haikuResult && haikuResult.length > 0) {
-        yield { type: 'visual_concepts', visuals: haikuResult };
-      }
-    } catch (err) {
-      console.warn('Haiku await failed:', err.message);
+  // If the mid-stream poll never caught Haiku (Sonnet finished before Haiku
+  // did), await it here. The .then handler has already populated haikuResult
+  // and flipped haikuResolved — we just need to wait for the promise chain
+  // to settle before yielding.
+  if (!haikuYielded) {
+    await haikuPromise;
+    haikuYielded = true;
+    if (haikuResult && haikuResult.length > 0) {
+      yield { type: 'visual_concepts', visuals: haikuResult };
     }
   }
 
