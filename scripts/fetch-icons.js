@@ -15,8 +15,11 @@
  *   - has stroke but no fill (our rasterizer only fills)
  *   - has no valid viewBox
  *
- * Dedupe: on filename collision, Font Awesome wins (cleaner silhouette style,
- * more iconic visual identity for our particle-fill rendering).
+ * Dedupe: on filename collision, Material Symbols wins. MS icons are simpler
+ * flat silhouettes with fewer decorative subpaths, so at our 300px particle
+ * rasterization they read as coherent shapes. FA icons often encode visible
+ * seams (basketball, car wheels, skull eye sockets) which scale up to wide
+ * voids at our render size; we fall back to them only when MS has no match.
  *
  * Output:
  *   public/shapes/library/{kebab}.svg
@@ -177,17 +180,17 @@ function main() {
   }).map(i => ({ ...i, source: 'material' }));
   console.log(`  → ${msIcons.length} valid Material Symbols icons`);
 
-  // 3. Merge, preferring Font Awesome on name collision
+  // 3. Merge, preferring Material Symbols on name collision (see header comment).
   const seen = new Map();
-  for (const icon of faIcons) seen.set(icon.name, icon);
-  let msAddedCount = 0;
-  for (const icon of msIcons) {
+  for (const icon of msIcons) seen.set(icon.name, icon);
+  let faAddedCount = 0;
+  for (const icon of faIcons) {
     if (!seen.has(icon.name)) {
       seen.set(icon.name, icon);
-      msAddedCount++;
+      faAddedCount++;
     }
   }
-  console.log(`[fetch-icons] merged: ${faIcons.length} FA + ${msAddedCount} unique MS = ${seen.size} total`);
+  console.log(`[fetch-icons] merged: ${msIcons.length} MS + ${faAddedCount} unique FA = ${seen.size} total`);
 
   // 4. Write cleaned SVGs and build manifest
   const manifest = {

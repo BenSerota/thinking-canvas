@@ -311,7 +311,112 @@ export function rasterizeShape(shapeName, resolution = 300) {
 }
 
 /**
+ * Morphological dilation: each output pixel is set if ANY input pixel within
+ * a radius-r disk is set. Out-of-bounds is treated as unset.
+ */
+function dilateMask(mask, n, r) {
+  const out = new Uint8Array(mask.length);
+  const r2 = r * r;
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      if (mask[y * n + x]) { out[y * n + x] = 1; continue; }
+      let hit = 0;
+      for (let dy = -r; dy <= r && !hit; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= n) continue;
+        for (let dx = -r; dx <= r; dx++) {
+          if (dx * dx + dy * dy > r2) continue;
+          const nx = x + dx;
+          if (nx < 0 || nx >= n) continue;
+          if (mask[ny * n + nx]) { hit = 1; break; }
+        }
+      }
+      if (hit) out[y * n + x] = 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * Morphological erosion: each output pixel remains set only if ALL pixels
+ * within a radius-r disk are set. Out-of-bounds is treated as SET so the
+ * shape isn't eroded at the canvas boundary (important for icons that span
+ * the full bitmap — e.g. the basketball disc touches all four edges).
+ */
+function erodeMask(mask, n, r) {
+  const out = new Uint8Array(mask.length);
+  const r2 = r * r;
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      if (!mask[y * n + x]) continue;
+      let stays = true;
+      for (let dy = -r; dy <= r && stays; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= n) continue;
+        for (let dx = -r; dx <= r; dx++) {
+          if (dx * dx + dy * dy > r2) continue;
+          const nx = x + dx;
+          if (nx < 0 || nx >= n) continue;
+          if (!mask[ny * n + nx]) { stays = false; break; }
+        }
+      }
+      if (stays) out[y * n + x] = 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * Count connected components in a binary mask, ignoring specks under
+ * `minSize`. Uses iterative 4-connectivity flood fill. Used to detect
+ * whether a rasterized SVG needs aggressive closing — if the shape
+ * came out as multiple large islands (basketball's 8 wedges, brain's
+ * two hemispheres), we boost the morphological closing radius to
+ * bridge them into one silhouette.
+ */
+function countLargeComponents(mask, n, minSize = 500) {
+  const visited = new Uint8Array(mask.length);
+  const stack = [];
+  let count = 0;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i] || visited[i]) continue;
+    stack.length = 0;
+    stack.push(i);
+    let size = 0;
+    while (stack.length) {
+      const idx = stack.pop();
+      if (visited[idx] || !mask[idx]) continue;
+      visited[idx] = 1;
+      size++;
+      const x = idx % n;
+      const y = (idx - x) / n;
+      if (x > 0) stack.push(idx - 1);
+      if (x < n - 1) stack.push(idx + 1);
+      if (y > 0) stack.push(idx - n);
+      if (y < n - 1) stack.push(idx + n);
+    }
+    if (size >= minSize) count++;
+  }
+  return count;
+}
+
+/**
  * Core rasterization: SVG paths → particle point cloud.
+ *
+ * Many library icons (Font Awesome basketball, skull eye sockets, car wheels,
+ * brain midline) encode decorative detail as intentional gaps between subpaths.
+ * At our 300px resolution those gaps scale to 10-30px voids and the canvas
+ * reads as floating fragments instead of a coherent silhouette. We apply a
+ * morphological closing (dilate→erode) with an adaptive radius:
+ *
+ *   - Default R ≈ 2.5% of min(bboxW, bboxH) (closes ~14px gaps on a 280px
+ *     icon — enough for skull eye sockets, tooth cusp, car window line).
+ *   - Boosted R ≈ 5% when the raw mask has ≥ 2 large connected components
+ *     (basketball's 8 wedges, brain's hemispheres) — closes ~30px seams.
+ *
+ * This keeps single-component icons untouched while aggressively merging
+ * inherently multi-part icons into coherent silhouettes.
+ *
  * Edge pixels are duplicated 3x so more particles cluster on outlines.
  */
 function rasterizeFromPaths(paths, viewBox, resolution = 300) {
@@ -337,16 +442,39 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   const imageData = ctx.getImageData(0, 0, resolution, resolution);
   const data = imageData.data;
-  const filled = new Uint8Array(resolution * resolution);
   const points = [];
 
-  // First pass: identify filled pixels
+  // First pass: build raw mask + compute bounding box
+  const raw = new Uint8Array(resolution * resolution);
+  let minX = resolution, maxX = -1, minY = resolution, maxY = -1;
   for (let y = 0; y < resolution; y++) {
     for (let x = 0; x < resolution; x++) {
       const i = (y * resolution + x) * 4;
       if (data[i + 3] > 128) {
-        filled[y * resolution + x] = 1;
+        raw[y * resolution + x] = 1;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
       }
+    }
+  }
+
+  // Morphological closing to fill decorative gaps between subpaths.
+  // Use connected-components count to decide the closing radius:
+  //   1 large island → light closing (2.5% of bbDim) — just smooth small seams
+  //   2+ large islands → aggressive closing (5% of bbDim) — bridge the islands
+  // The CC count is cheap (single 4-connectivity flood-fill pass) and lets us
+  // avoid over-closing icons like `envelope` (flap is a separate island but
+  // it's intentional visual detail).
+  let filled = raw;
+  if (maxX >= minX && maxY >= minY) {
+    const bbDim = Math.max(1, Math.min(maxX - minX, maxY - minY));
+    const components = countLargeComponents(raw, resolution);
+    const fraction = components >= 2 ? 0.05 : 0.025;
+    const R = Math.max(0, Math.round(bbDim * fraction));
+    if (R >= 2) {
+      filled = erodeMask(dilateMask(raw, resolution, R), resolution, R);
     }
   }
 
@@ -377,14 +505,30 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300) {
     }
   }
 
-  // Cap at 30,000 points for performance
-  if (points.length > 30000) {
-    // Random subsample
-    for (let i = points.length - 1; i > 30000; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [points[i], points[j]] = [points[j], points[i]];
+  // Cap at 30,000 points for performance. The rasterizer emits points in
+  // scanline order (top-to-bottom, left-to-right), so a naive truncation
+  // would keep only the top of the shape. A partial Fisher-Yates that
+  // collects samples at the END of the array then truncates at the START
+  // is also wrong — it keeps the un-sampled items. We do a proper partial
+  // shuffle that moves samples to the FRONT:
+  //   for i in [0, K): swap points[i] with a random index j in [i, N)
+  //   then truncate to length K.
+  // This yields a uniform K-sample of the N points. Without this, downstream
+  // consumers that use the prefix (canvas.js takes the first ~10k points)
+  // would see horizontal gaps matching the scanlines that fell between the
+  // few preserved top rows and the blocks of swapped-in rows.
+  const CAP = 30000;
+  if (points.length > CAP) {
+    const n = points.length;
+    for (let i = 0; i < CAP; i++) {
+      const j = i + Math.floor(Math.random() * (n - i));
+      if (j !== i) {
+        const tmp = points[i];
+        points[i] = points[j];
+        points[j] = tmp;
+      }
     }
-    points.length = 30000;
+    points.length = CAP;
   }
 
   return points;
