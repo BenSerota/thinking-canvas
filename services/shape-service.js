@@ -16,6 +16,7 @@
  */
 
 const iconMatcher = require('./icon-matcher');
+const iconifyService = require('./iconify-service');
 const svgGenerator = require('./svg-generator');
 const curatedIcons = require('./curated-icons.json');
 
@@ -116,7 +117,26 @@ async function resolveVisual(visual) {
     const curated = resolveCurated(iconic, concept);
     if (curated) return curated;
 
-    // 1. Library / cached-generated match
+    // 1. Iconify web search — 200k+ icons across 150+ open-licensed sets.
+    // Runs BEFORE the local embedding matcher (user preference): the much
+    // larger catalog tends to produce more specific matches than our 5,497-
+    // icon local library. Cache-miss path takes ~200-500ms (two HTTP calls);
+    // cache-hit path is disk-only (~1ms). License-filtered to commercial-safe
+    // OSS sets; palette-filtered to single-color silhouettes. On any failure
+    // (timeout, no match, sanitize reject) returns null and we fall through
+    // to the local matcher, preserving every existing behavior.
+    const iconify = await iconifyService.findAndCache(iconic);
+    if (iconify) {
+      return {
+        name: iconify.name,
+        concept,
+        dynamic: iconify.url,
+        source: 'iconify',
+        score: 1.0,
+      };
+    }
+
+    // 2. Library / cached-generated match
     const match = await iconMatcher.findBestMatch(iconic, { threshold: EMBEDDING_THRESHOLD });
     if (match) {
       // Determine which directory the SVG lives in. Generated icons live in
@@ -134,7 +154,7 @@ async function resolveVisual(visual) {
       };
     }
 
-    // 2. On-demand generation with strict validation
+    // 3. On-demand generation with strict validation
     const gen = await svgGenerator.generate(iconic);
     if (gen && gen.ok) {
       return {

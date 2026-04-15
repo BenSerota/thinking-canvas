@@ -17,3 +17,7 @@ public/shapes/library-manifest.json
 # after a prompt change; old dirs become dead weight on disk.
 public/shapes/generated/
 public/shapes/generated-*/
+
+# Runtime-fetched SVGs from api.iconify.design. Safe to wipe; will re-fetch on
+# demand. Keyed by the user-concept kebab, not the Iconify icon name.
+public/shapes/iconify-cache/

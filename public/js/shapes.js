@@ -556,11 +556,15 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
  * library icons need seam-bridging (basketball seams, envelope flap gaps);
  * generated (v2+) and curated (hand-drawn) icons have intentional holes
  * (Pisa tier bands, Colosseum arches) and must not be closed.
+ * Iconify-cached icons come from clean icon sets (Material Symbols, Tabler,
+ * Phosphor, etc.) — they're library-quality with no intentional holes to
+ * preserve, so they get the same seam-bridging treatment as FA/Material.
  */
 function inferShapeSource(url) {
   if (!url) return 'library';
   if (url.includes('/shapes/generated')) return 'generated';
   if (url.includes('/shapes/curated')) return 'generated';
+  if (url.includes('/shapes/iconify-cache')) return 'library';
   if (url.includes('/shapes/library')) return 'library';
   return 'library';
 }
