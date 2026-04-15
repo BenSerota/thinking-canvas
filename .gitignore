@@ -13,4 +13,7 @@ public/shapes/library/
 public/shapes/library-manifest.json
 
 # Runtime-generated SVGs (Sonnet output cache). Safe to wipe; will regenerate on demand.
+# Versioned directory — bump svg-generator.js PROMPT_VERSION to invalidate the cache
+# after a prompt change; old dirs become dead weight on disk.
 public/shapes/generated/
+public/shapes/generated-*/

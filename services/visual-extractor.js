@@ -23,6 +23,12 @@ Think associatively and iconically — what would appear in a simple illustratio
 - "quantum physics" → atom, electron, wave
 - "phrenology" → skull, brain, measurement
 
+When the topic is a famous landmark, monument, or proper-noun structure with a distinctive silhouette, INCLUDE the proper noun itself as one of the iconics (it routes to a hand-curated icon). Examples:
+- "Leaning Tower of Pisa" → leaning tower of pisa, bell, marble
+- "Colosseum" → colosseum, gladiator, arch
+- "Eiffel Tower" → eiffel tower, paris, beacon
+- "Statue of Liberty" → statue of liberty, torch, crown
+
 For each concept, provide:
 - "iconic": the specific visual object people would picture. Be creative and specific — 1-3 words, lowercase, no punctuation (e.g., "top hat", "log cabin", "stethoscope", "electron orbit", "lincoln memorial", "phrenology skull"). There is no constrained vocabulary for this field.
 - "shape": a safety-net fallback — the closest match from this list: car, truck, bicycle, airplane, boat, dog, cat, bird, fish, horse, house, building, tree, mountain, sun, cloud, flower, phone, computer, book, cup, guitar, key, person, money, heart, star, food

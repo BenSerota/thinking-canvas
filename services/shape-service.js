@@ -17,6 +17,7 @@
 
 const iconMatcher = require('./icon-matcher');
 const svgGenerator = require('./svg-generator');
+const curatedIcons = require('./curated-icons.json');
 
 // Safety-net built-in shape names (must match keys in client shapes.js SHAPE_PATHS)
 const BUILTIN_NAMES = new Set([
@@ -26,6 +27,57 @@ const BUILTIN_NAMES = new Set([
   'phone', 'computer', 'book', 'cup', 'guitar', 'key',
   'person', 'question', 'search', 'money', 'heart', 'star', 'food',
 ]);
+
+/** Normalize an iconic phrase to a kebab key for curated-map lookup. */
+function curatedKey(text) {
+  return String(text || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
+ * Consult the hand-curated map in `curated-icons.json`. Returns the resolved
+ * shape object (same shape as resolveVisual's other return paths) or null if
+ * no curated entry matches.
+ *
+ * This runs BEFORE the embedding matcher so it can force the right icon for
+ * concepts the matcher gets wrong (e.g. "colosseum" embeds closer to some
+ * random sports icon than to building-columns) and for proper nouns the
+ * generator blob-fails on ("leaning tower of pisa"). Grow this list as the
+ * server logs surface more bad-match or blob-gen cases.
+ */
+function resolveCurated(iconic, concept) {
+  const key = curatedKey(iconic);
+  if (!key) return null;
+  const entry = curatedIcons[key];
+  if (!entry || typeof entry !== 'object') return null;
+  // Prefer `curated` (hand-drawn SVG in public/shapes/curated/ — survives
+  // `npm run fetch-icons` because that dir is tracked and not regenerated).
+  // Fall back to `library` (FontAwesome/Material asset in public/shapes/library/).
+  if (entry.curated) {
+    return {
+      name: entry.curated,
+      concept,
+      dynamic: `/shapes/curated/${entry.curated}.svg`,
+      source: 'curated',
+      score: 1.0,
+    };
+  }
+  if (entry.library) {
+    return {
+      name: entry.library,
+      concept,
+      dynamic: `/shapes/library/${entry.library}.svg`,
+      source: 'curated',
+      score: 1.0,
+    };
+  }
+  return null;
+}
 
 // Raised from 0.55 → 0.60 after live testing. Borderline matches at 0.55-0.60
 // tended to feel semantically off (e.g. "bumpy head map" → tools-flat-head at
@@ -58,11 +110,19 @@ async function resolveVisual(visual) {
   const concept = iconic || builtinFallback;
 
   if (iconic) {
+    // 0. Hand-curated override — wins over both the matcher and the generator
+    // for concepts where the matcher picks the wrong icon or the generator
+    // produces a blob. See `services/curated-icons.json`.
+    const curated = resolveCurated(iconic, concept);
+    if (curated) return curated;
+
     // 1. Library / cached-generated match
     const match = await iconMatcher.findBestMatch(iconic, { threshold: EMBEDDING_THRESHOLD });
     if (match) {
-      // Determine which directory the SVG lives in
-      const subdir = match.source === 'generated' ? 'generated' : 'library';
+      // Determine which directory the SVG lives in. Generated icons live in
+      // a versioned subdir (see svg-generator.js GENERATED_SUBDIR); library
+      // icons live in `library/`.
+      const subdir = match.source === 'generated' ? svgGenerator.GENERATED_SUBDIR : 'library';
       return {
         name: match.name,
         concept,

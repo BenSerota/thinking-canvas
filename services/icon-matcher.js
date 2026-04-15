@@ -20,7 +20,11 @@ const embeddingService = require('./embedding-service');
 const ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(ROOT, 'public', 'shapes', 'library-manifest.json');
 const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'library-embeddings.json');
-const GENERATED_DIR = path.join(ROOT, 'public', 'shapes', 'generated');
+// Generated-SVG cache directory — versioned so prompt changes bypass the old
+// cache without manual cleanup. Kept in sync with svg-generator.js
+// GENERATED_SUBDIR constant; changing the version there requires bumping
+// PROMPT_VERSION and the old files become dead weight on disk (safe to delete).
+const GENERATED_DIR = path.join(ROOT, 'public', 'shapes', 'generated-v2');
 
 const DEFAULT_THRESHOLD = 0.55;
 
@@ -84,9 +88,11 @@ async function init() {
       state.nameToIdx.set(name, state.names.length - 1);
     }
 
-    // Scan public/shapes/generated for previously-cached generations and
-    // add them to the exact-match set (their embeddings get computed lazily
-    // on first embedding-match call if needed)
+    // Scan GENERATED_DIR (versioned, currently `public/shapes/generated-v2/`)
+    // for previously-cached generations and add them to the exact-match set.
+    // Their embeddings get computed lazily on first embedding-match call if needed.
+    // Old unversioned `generated/` directories from prior prompt versions are
+    // deliberately NOT scanned — bumping the version effectively wipes the cache.
     if (fs.existsSync(GENERATED_DIR)) {
       for (const f of fs.readdirSync(GENERATED_DIR)) {
         if (!f.endsWith('.svg')) continue;

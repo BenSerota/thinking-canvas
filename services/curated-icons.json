@@ -1,0 +1,69 @@
+{
+  "_comment": "Hand-curated concept → icon overrides. Consulted BEFORE the embedding matcher and the svg-generator in shape-service.resolveVisual. Use kebab-case keys (the lookup normalizes the incoming iconic phrase the same way). Add an entry here for any concept where the embedding matcher picks the wrong icon or the generator produces a blob.",
+  "_format": "Each value is { library: <filename-in-public/shapes/library/> } OR { curated: <filename-in-public/shapes/curated/> }. Prefer `library` to reuse FontAwesome/Material assets. Use `curated` only for hand-drawn SVGs that don't exist in the auto-generated library (those live in public/shapes/curated/ and survive `npm run fetch-icons`).",
+
+  "colosseum": { "library": "building-columns" },
+  "the-colosseum": { "library": "building-columns" },
+  "roman-colosseum": { "library": "building-columns" },
+  "amphitheater": { "library": "building-columns" },
+  "parthenon": { "library": "building-columns" },
+  "ancient-stone-arches": { "library": "building-columns" },
+  "stone-arches": { "library": "building-columns" },
+  "roman-arches": { "library": "building-columns" },
+  "ancient-ruins": { "library": "building-columns" },
+  "roman-ruins": { "library": "building-columns" },
+  "ancient-amphitheater": { "library": "building-columns" },
+  "roman-architecture": { "library": "building-columns" },
+  "roman-columns": { "library": "columns" },
+  "stone-amphitheater": { "library": "building-columns" },
+
+  "leaning-tower-of-pisa": { "curated": "leaning-tower-pisa" },
+  "tower-of-pisa": { "curated": "leaning-tower-pisa" },
+  "pisa-tower": { "curated": "leaning-tower-pisa" },
+  "pisa": { "curated": "leaning-tower-pisa" },
+  "leaning-tower": { "curated": "leaning-tower-pisa" },
+  "the-leaning-tower": { "curated": "leaning-tower-pisa" },
+  "tilted-tower": { "curated": "leaning-tower-pisa" },
+
+  "brain": { "library": "brain" },
+  "brain-map": { "library": "brain" },
+  "brain-map-diagram": { "library": "brain" },
+  "brain-diagram": { "library": "brain" },
+  "human-brain": { "library": "brain" },
+  "cerebrum": { "library": "brain" },
+  "mind": { "library": "brain" },
+
+  "castle": { "library": "castle" },
+  "fortress": { "library": "castle" },
+  "palace": { "library": "castle" },
+
+  "church": { "library": "church" },
+  "cathedral": { "library": "church" },
+  "chapel": { "library": "church" },
+
+  "mosque": { "library": "mosque" },
+  "synagogue": { "library": "synagogue" },
+  "hindu-temple": { "library": "temple-hindu" },
+  "buddhist-temple": { "library": "temple-buddhist" },
+
+  "monument": { "library": "monument" },
+  "obelisk": { "library": "monument" },
+  "washington-monument": { "library": "monument" },
+
+  "landmark": { "library": "landmark" },
+  "dome": { "library": "landmark-dome" },
+  "capitol": { "library": "landmark-dome" },
+  "us-capitol": { "library": "landmark-dome" },
+
+  "stadium": { "library": "stadium" },
+  "arena": { "library": "stadium" },
+
+  "observation-tower": { "library": "tower-observation" },
+  "watchtower": { "library": "tower-observation" },
+
+  "broadcast-tower": { "library": "tower-broadcast" },
+  "radio-tower": { "library": "tower-broadcast" },
+  "antenna-tower": { "library": "tower-broadcast" },
+
+  "cell-tower": { "library": "tower-cell" }
+}

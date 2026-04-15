@@ -417,9 +417,22 @@ function countLargeComponents(mask, n, minSize = 500) {
  * This keeps single-component icons untouched while aggressively merging
  * inherently multi-part icons into coherent silhouettes.
  *
+ * `shapeSource` gates the closing step:
+ *   - 'library' (default): full closing as described above — needed because
+ *     FA/MS icons and some built-ins (basketball seams, envelope flap)
+ *     express decorative detail as separate subpaths that need bridging.
+ *   - 'generated': skip closing entirely. The SVG generator's v2 prompt uses
+ *     fill-rule="evenodd" for intentional holes (arch openings, brain sulci);
+ *     morphological closing would seal them back into blobs. Generated SVGs
+ *     already come out as coherent single-component silhouettes.
+ *
+ * Path fills use fill-rule="evenodd" so holes carved by reversed subpaths
+ * render as holes (nonzero would fill them solid). This is essential for
+ * v2-generated SVGs.
+ *
  * Edge pixels are duplicated 3x so more particles cluster on outlines.
  */
-function rasterizeFromPaths(paths, viewBox, resolution = 300) {
+function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library') {
   const canvas = document.createElement('canvas');
   canvas.width = resolution;
   canvas.height = resolution;
@@ -435,7 +448,7 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300) {
 
   for (const pathStr of paths) {
     const path = new Path2D(pathStr);
-    ctx.fill(path);
+    ctx.fill(path, 'evenodd');
   }
 
   // Extract filled pixel positions at 1px resolution
@@ -467,8 +480,12 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300) {
   // The CC count is cheap (single 4-connectivity flood-fill pass) and lets us
   // avoid over-closing icons like `envelope` (flap is a separate island but
   // it's intentional visual detail).
+  //
+  // SKIPPED for generated and builtin sources — their SVGs are authored as
+  // coherent single-component silhouettes with intentional holes (evenodd).
+  // Closing would seal those holes (Colosseum arches, brain sulcus) into blobs.
   let filled = raw;
-  if (maxX >= minX && maxY >= minY) {
+  if (shapeSource === 'library' && maxX >= minX && maxY >= minY) {
     const bbDim = Math.max(1, Math.min(maxX - minX, maxY - minY));
     const components = countLargeComponents(raw, resolution);
     const fraction = components >= 2 ? 0.05 : 0.025;
@@ -535,6 +552,20 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300) {
 }
 
 /**
+ * Infer the shape source from its URL. Used to gate morphological closing —
+ * library icons need seam-bridging (basketball seams, envelope flap gaps);
+ * generated (v2+) and curated (hand-drawn) icons have intentional holes
+ * (Pisa tier bands, Colosseum arches) and must not be closed.
+ */
+function inferShapeSource(url) {
+  if (!url) return 'library';
+  if (url.includes('/shapes/generated')) return 'generated';
+  if (url.includes('/shapes/curated')) return 'generated';
+  if (url.includes('/shapes/library')) return 'library';
+  return 'library';
+}
+
+/**
  * Load an external SVG file and rasterize it into particle points.
  * Returns a promise that resolves to an array of {x, y} points.
  */
@@ -564,7 +595,8 @@ export async function loadExternalShape(url, resolution = 300) {
 
     if (paths.length === 0) return null;
 
-    return rasterizeFromPaths(paths, viewBox, resolution);
+    const shapeSource = inferShapeSource(url);
+    return rasterizeFromPaths(paths, viewBox, resolution, shapeSource);
   } catch (e) {
     console.warn('Failed to load external shape:', url, e);
     return null;
