@@ -1,2 +1,16 @@
 node_modules/
 package-lock.json
+
+# Local env + macOS cruft
+.env
+.DS_Store
+.claude/
+
+# Generated from `npm run setup-icons` (icon library + embeddings).
+# Regenerate locally with `npm run setup-icons`; CI/deploy should run it as a build step.
+data/
+public/shapes/library/
+public/shapes/library-manifest.json
+
+# Runtime-generated SVGs (Sonnet output cache). Safe to wipe; will regenerate on demand.
+public/shapes/generated/

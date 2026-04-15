@@ -184,6 +184,47 @@ html, body {
   animation: blink 0.8s infinite;
 }
 
+/* Thinking block — collapsible disclosure */
+.chat-message-thinking {
+  padding: 4px 16px;
+}
+
+.chat-thinking {
+  background: rgba(196, 149, 106, 0.08);
+  border: 1px solid rgba(196, 149, 106, 0.15);
+  border-radius: 8px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.chat-thinking summary {
+  padding: 8px 12px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  color: var(--accent-dim);
+  cursor: pointer;
+  user-select: none;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chat-thinking summary:hover {
+  color: var(--accent);
+}
+
+.chat-thinking-content {
+  padding: 8px 12px 12px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  border-top: 1px solid rgba(196, 149, 106, 0.1);
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .chat-input-area {
   padding: 16px;
   border-top: 1px solid var(--border);

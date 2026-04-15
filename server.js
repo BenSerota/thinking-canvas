@@ -1,92 +1,41 @@
+// Load .env manually (dotenvx intercepts dotenv and breaks it)
+const fs = require('fs');
+const envPath = require('path').join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  for (const line of fs.readFileSync(envPath, 'utf-8').split('\n')) {
+    const match = line.match(/^\s*([^#=]+?)\s*=\s*(.*)\s*$/);
+    if (match && !process.env[match[1]]) {
+      process.env[match[1]] = match[2];
+    }
+  }
+}
+
 const express = require('express');
 const path = require('path');
-const Anthropic = require('@anthropic-ai/sdk');
+
+// Services
+const chatService = require('./services/chat-service');
+const shapeService = require('./services/shape-service');
+const conceptService = require('./services/concept-service'); // fallback only
+const iconMatcher = require('./services/icon-matcher');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const anthropic = new Anthropic();
+// Warm up icon matcher at boot so first request doesn't pay the init cost
+iconMatcher.init().catch(err => console.warn('[server] iconMatcher init failed:', err.message));
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Available shapes for concept visualization
-const AVAILABLE_SHAPES = [
-  'car', 'truck', 'bicycle', 'airplane', 'boat',
-  'dog', 'cat', 'bird', 'fish', 'horse',
-  'house', 'building', 'castle',
-  'tree', 'mountain', 'sun', 'cloud', 'flower',
-  'phone', 'computer', 'book', 'cup', 'key', 'guitar',
-  'person', 'question', 'search', 'star', 'food'
-];
-
-// Keyword-to-concept mapping for canvas visuals
-const CONCEPT_KEYWORDS = {
-  car: /\b(car|vehicle|auto|sedan|suv|drive|driving|truck|van)\b/i,
-  dog: /\b(dog|puppy|canine|labrador|retriever|dalmatian)\b/i,
-  cat: /\b(cat|kitten|feline)\b/i,
-  horse: /\b(horse|pony|stallion|mare)\b/i,
-  bird: /\b(bird|parrot|eagle|sparrow|penguin)\b/i,
-  fish: /\b(fish|salmon|trout|aquarium|ocean creature)\b/i,
-  airplane: /\b(fly|flight|airplane|plane|airport|travel|trip|vacation)\b/i,
-  boat: /\b(boat|ship|sail|cruise|ocean|sea)\b/i,
-  house: /\b(home|house|apartment|rent|real estate|room|living)\b/i,
-  building: /\b(building|office|skyscraper|city|urban)\b/i,
-  tree: /\b(tree|forest|wood|nature|garden|plant)\b/i,
-  mountain: /\b(mountain|hill|climb|hike|hiking|trail)\b/i,
-  sun: /\b(sun|sunny|weather|warm|summer|beach)\b/i,
-  cloud: /\b(cloud|rain|storm|weather|sky)\b/i,
-  flower: /\b(flower|rose|garden|bloom|blossom)\b/i,
-  computer: /\b(computer|laptop|software|code|program|tech|ai|algorithm)\b/i,
-  phone: /\b(phone|mobile|call|text|smartphone)\b/i,
-  book: /\b(book|read|novel|story|author|library|write|writing)\b/i,
-  guitar: /\b(music|song|instrument|guitar|piano|band|concert|sing)\b/i,
-  food: /\b(food|cook|recipe|restaurant|eat|dinner|lunch|meal|breakfast)\b/i,
-  cup: /\b(coffee|tea|drink|cup|beverage)\b/i,
-  person: /\b(person|people|friend|family|human|someone)\b/i,
-  star: /\b(star|space|universe|galaxy|night|amazing|great)\b/i,
-};
-
-/**
- * Extract visual concepts from a message using keyword matching.
- * Returns 1-2 shape names for the canvas to display.
- */
-function extractConcepts(message) {
-  const matches = [];
-  for (const [concept, pattern] of Object.entries(CONCEPT_KEYWORDS)) {
-    if (pattern.test(message)) {
-      matches.push(concept);
-    }
-  }
-  if (matches.length === 0) return ['search', 'question'];
-  return matches.slice(0, 2);
-}
-
-/**
- * Build messages array from conversation history for the Anthropic API.
- */
-function buildMessages(message, history) {
-  const messages = [];
-
-  if (history && history.length > 0) {
-    const recent = history.slice(-10);
-    for (const msg of recent) {
-      messages.push({
-        role: msg.role === 'user' ? 'user' : 'assistant',
-        content: msg.content || msg.text,
-      });
-    }
-  }
-
-  messages.push({ role: 'user', content: message });
-  return messages;
-}
-
-const SYSTEM_PROMPT = `You are a friendly, conversational AI assistant called Thinking Canvas. You're embedded in a visual interface where particles on a canvas form shapes related to the conversation topic. Keep your responses concise but helpful (2-4 sentences typically). Be warm and engaging.`;
-
 /**
  * POST /api/chat/stream
- * Streams responses via the Anthropic SDK.
+ *
+ * Pipeline:
+ * 1. Chat Service → Sonnet extended thinking + streaming response
+ * 2. Visual Extractor (Haiku) → fires concurrently after thinking block
+ * 3. Shape Service → maps Haiku concepts to renderable shapes
+ * 4. SSE → typed events to client
  */
 app.post('/api/chat/stream', async (req, res) => {
   const { message, history } = req.body;
@@ -101,40 +50,54 @@ app.post('/api/chat/stream', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  // Send concepts immediately based on the user's message
-  const concepts = extractConcepts(message);
-  res.write(`data: ${JSON.stringify({ type: 'concepts', concepts })}\n\n`);
-
-  const messages = buildMessages(message, history);
-  let aborted = false;
-
-  const stream = anthropic.messages.stream({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1024,
-    system: SYSTEM_PROMPT,
-    messages,
-  });
-
-  stream.on('text', (text) => {
-    if (!aborted && !res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ type: 'text', text })}\n\n`);
-    }
-  });
-
-  // Handle client disconnect
-  req.on('close', () => {
-    aborted = true;
-    stream.abort();
-  });
+  // No immediate concepts — let canvas stay in gathering/thinking state
+  // Haiku will provide concepts when ready
 
   try {
-    await stream.finalMessage();
-  } catch (err) {
-    if (aborted || err.name === 'APIUserAbortError' || err.message?.includes('aborted')) {
-      console.log('Stream aborted (client disconnected)');
-      return;
+    for await (const event of chatService.createStream(message, history)) {
+      if (res.writableEnded) break;
+
+      switch (event.type) {
+        case 'thinking_text': {
+          // Raw thinking text for collapsible UI
+          res.write(`data: ${JSON.stringify({ type: 'thinking', text: event.text })}\n\n`);
+          break;
+        }
+
+        case 'visual_concepts': {
+          // Haiku-extracted iconic concepts → map through iconMatcher/generator → send to client
+          const iconics = event.visuals.map(v => v.iconic).filter(Boolean);
+          if (iconics.length > 0) {
+            console.log('[visuals] Iconic concepts:', iconics.join(', '));
+          }
+
+          const shapes = await shapeService.mapConceptsToShapes(event.visuals);
+
+          // Log how each iconic resolved — source + score
+          for (let i = 0; i < event.visuals.length && i < shapes.length; i++) {
+            const iconic = event.visuals[i].iconic;
+            const s = shapes[i];
+            const scoreStr = typeof s.score === 'number' ? `, ${s.score.toFixed(2)}` : '';
+            console.log(`[icons] "${iconic}" → ${s.name}${s.dynamic ? '.svg' : ''} (${s.source}${scoreStr})`);
+          }
+
+          res.write(`data: ${JSON.stringify({ type: 'concepts', concepts: shapes, source: 'haiku' })}\n\n`);
+          break;
+        }
+
+        case 'text': {
+          res.write(`data: ${JSON.stringify({ type: 'text', text: event.text })}\n\n`);
+          break;
+        }
+
+        case 'done': {
+          break;
+        }
+      }
     }
-    console.error('Anthropic API error:', err.name, err.message, err.status);
+  } catch (err) {
+    if (res.writableEnded) return;
+    console.error('Stream error:', err.name, err.message);
     if (!res.writableEnded) {
       res.write(`data: ${JSON.stringify({ type: 'text', text: `API error: ${err.message}` })}\n\n`);
     }
@@ -156,29 +119,30 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'No message provided' });
   }
 
-  const concepts = extractConcepts(message);
-
   try {
-    const messages = buildMessages(message, history);
+    let fullText = '';
+    let visuals = [];
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages,
-    });
+    for await (const event of chatService.createStream(message, history)) {
+      if (event.type === 'text') fullText += event.text;
+      if (event.type === 'visual_concepts') visuals = event.visuals;
+    }
 
-    const text = response.content
-      .filter(block => block.type === 'text')
-      .map(block => block.text)
-      .join('');
-
-    res.json({ text, concepts });
+    let shapes;
+    if (visuals.length > 0) {
+      shapes = await shapeService.mapConceptsToShapes(visuals);
+    } else {
+      // Fallback: build pseudo-visuals from regex-extracted concepts
+      const words = conceptService.extractConceptsFromText(message);
+      const pseudoVisuals = words.map(w => ({ iconic: w, shape: w }));
+      shapes = await shapeService.mapConceptsToShapes(pseudoVisuals);
+    }
+    res.json({ text: fullText, concepts: shapes });
   } catch (err) {
-    console.error('Anthropic API error:', err.message);
+    console.error('Chat error:', err.message);
     res.status(500).json({
       text: 'Error: Could not get response from Claude API. Check your ANTHROPIC_API_KEY.',
-      concepts: ['question'],
+      concepts: [{ name: 'question', dynamic: null }],
     });
   }
 });

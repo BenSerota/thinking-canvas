@@ -1,10 +1,15 @@
 /**
  * Orchestrator — ties together the Thinking Canvas, Chat Panel, and AI backend
+ *
+ * Three visual states:
+ * 1. Idle — particles drift ambient
+ * 2. Thinking — hurricane vortex while LLM reasons
+ * 3. Forming — shapes materialize from Haiku-extracted concepts
  */
 
 import { ThinkingCanvas } from './canvas.js';
 import { ChatPanel } from './chat.js';
-import { rasterizeShape, conceptToShape, getAvailableShapes } from './shapes.js';
+import { rasterizeShape, loadExternalShape, conceptToShape, getAvailableShapes } from './shapes.js';
 
 class App {
   constructor() {
@@ -15,10 +20,8 @@ class App {
     this.conceptIndex = 0;
     this.conceptTimer = null;
 
-    // Pre-cache some common shapes
     this._precacheShapes();
 
-    // Show welcome state
     setTimeout(() => {
       this.chat.addMessage('assistant',
         'Hello! I\'m your AI assistant with visual thinking. As we talk, watch the canvas — you\'ll see my thoughts taking shape. Try asking me about cars, pets, travel, or anything else!'
@@ -36,19 +39,18 @@ class App {
   async handleUserMessage(text) {
     this.chat.setInputEnabled(false);
 
-    // Show thinking state on canvas
-    this.canvas.setThinking(true);
+    // State 1 → 2: Gathering, then thinking when LLM starts reasoning
+    this.canvas.setState('gathering');
     this._clearConceptCycle();
 
     try {
-      // Use streaming endpoint
       const response = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
-          history: this.chat.getHistory()
-        })
+          history: this.chat.getHistory().slice(0, -1),
+        }),
       });
 
       const reader = response.body.getReader();
@@ -62,16 +64,28 @@ class App {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop(); // Keep incomplete line in buffer
+        buffer = lines.pop();
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
-          const data = JSON.parse(line.slice(6));
+          let data;
+          try {
+            data = JSON.parse(line.slice(6));
+          } catch (e) {
+            continue;
+          }
 
           switch (data.type) {
+            case 'thinking':
+              // Show thinking text in collapsible UI + enter hurricane state
+              this.chat.addThinkingMessage(data.text);
+              this.canvas.setState('thinking');
+              break;
+
             case 'concepts':
-              this.canvas.setThinking(false);
-              this._startConceptCycle(data.concepts);
+              // State 2 → 3: Haiku concepts arrived — form shapes
+              this.canvas.interimMode = false;
+              this._startConceptCycle(data.concepts || []);
               break;
 
             case 'text':
@@ -89,7 +103,7 @@ class App {
       }
     } catch (error) {
       console.error('Chat error:', error);
-      this.canvas.setThinking(false);
+      this.canvas.setState('idle');
       this.chat.addMessage('assistant', 'Sorry, something went wrong. Please try again.');
     }
 
@@ -97,37 +111,51 @@ class App {
   }
 
   /**
-   * Cycle through concepts, showing each shape for a few seconds.
+   * Start cycling through shapes from concept events.
    */
-  _startConceptCycle(concepts) {
+  _startConceptCycle(shapeInfos) {
     this._clearConceptCycle();
-
-    // Map concept names to shape names
-    this.currentConcepts = concepts.map(c => conceptToShape(c));
+    this.currentConcepts = shapeInfos;
     this.conceptIndex = 0;
-
     this._showCurrentConcept();
 
-    // Cycle through concepts if there are multiple
     if (this.currentConcepts.length > 1) {
       this.conceptTimer = setInterval(() => {
         this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
-        this._showCurrentConcept();
-      }, 4000); // Switch every 4 seconds
+        this._showCurrentConcept('crossfade');
+      }, 4000);
     }
   }
 
-  _showCurrentConcept() {
-    const shapeName = this.currentConcepts[this.conceptIndex];
-    let points = this.shapeCache[shapeName];
+  async _showCurrentConcept(transition = 'instant') {
+    const info = this.currentConcepts[this.conceptIndex];
+    if (!info) return;
 
+    let points = null;
+
+    // Try dynamic SVG first — use cached rasterization if we've seen this URL before
+    if (info.dynamic) {
+      const cacheKey = info.dynamic;
+      if (this.shapeCache[cacheKey]) {
+        points = this.shapeCache[cacheKey];
+      } else {
+        points = await loadExternalShape(info.dynamic);
+        if (points) this.shapeCache[cacheKey] = points;
+      }
+    }
+
+    // Fall back to built-in shape
     if (!points) {
-      points = rasterizeShape(shapeName);
-      if (points) this.shapeCache[shapeName] = points;
+      const shapeName = conceptToShape(info.name);
+      points = this.shapeCache[shapeName];
+      if (!points) {
+        points = rasterizeShape(shapeName);
+        if (points) this.shapeCache[shapeName] = points;
+      }
     }
 
     if (points) {
-      this.canvas.setShape(points, shapeName);
+      this.canvas.setShape(points, info.name, transition);
     }
   }
 
@@ -139,7 +167,6 @@ class App {
   }
 }
 
-// Initialize when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
   window.app = new App();
 });
