@@ -303,11 +303,11 @@ const SHAPE_PATHS = {
  * Rasterize an SVG path set into an array of {x, y} points (normalized 0-1).
  * Uses an offscreen canvas with edge-weighting for sharper shape outlines.
  */
-export function rasterizeShape(shapeName, resolution = 300) {
+export function rasterizeShape(shapeName, resolution = 300, maxPoints = 30000) {
   const shape = SHAPE_PATHS[shapeName];
   if (!shape) return null;
 
-  return rasterizeFromPaths(shape.paths, shape.viewBox, resolution);
+  return rasterizeFromPaths(shape.paths, shape.viewBox, resolution, 'library', maxPoints);
 }
 
 /**
@@ -432,7 +432,7 @@ function countLargeComponents(mask, n, minSize = 500) {
  *
  * Edge pixels are duplicated 3x so more particles cluster on outlines.
  */
-function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library') {
+function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library', maxPoints = 30000) {
   const canvas = document.createElement('canvas');
   canvas.width = resolution;
   canvas.height = resolution;
@@ -522,22 +522,26 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
     }
   }
 
-  // Cap at 30,000 points for performance. The rasterizer emits points in
-  // scanline order (top-to-bottom, left-to-right), so a naive truncation
-  // would keep only the top of the shape. A partial Fisher-Yates that
-  // collects samples at the END of the array then truncates at the START
-  // is also wrong — it keeps the un-sampled items. We do a proper partial
-  // shuffle that moves samples to the FRONT:
+  // Cap at `maxPoints` for performance AND to make the output safe for any
+  // downstream consumer that walks a prefix (e.g. `points[i % len]` in
+  // canvas.js _assignShape). The rasterizer emits points in scanline order
+  // (top-to-bottom, left-to-right), so a naive truncation would keep only
+  // the top of the shape. A partial Fisher-Yates that collects samples at
+  // the END of the array then truncates at the START is also wrong — it
+  // keeps the un-sampled items. We do a proper partial shuffle that moves
+  // samples to the FRONT:
   //   for i in [0, K): swap points[i] with a random index j in [i, N)
   //   then truncate to length K.
-  // This yields a uniform K-sample of the N points. Without this, downstream
-  // consumers that use the prefix (canvas.js takes the first ~10k points)
-  // would see horizontal gaps matching the scanlines that fell between the
-  // few preserved top rows and the blocks of swapped-in rows.
-  const CAP = 30000;
-  if (points.length > CAP) {
+  // This yields a uniform K-sample of the N points. Upstream sampling at
+  // the correct K (the consumer's particle budget) is how we PREVENT the
+  // slicing-bug regression from reappearing when PARTICLE_COUNT or
+  // SHAPE_PARTICLE_RATIO change. Historical: this bug bit us twice
+  // (f2a317d, f561856) when different consumers made the prefix-is-uniform
+  // assumption on their own. Do the sample once, here, correctly, always.
+  if (points.length > maxPoints) {
     const n = points.length;
-    for (let i = 0; i < CAP; i++) {
+    const K = maxPoints;
+    for (let i = 0; i < K; i++) {
       const j = i + Math.floor(Math.random() * (n - i));
       if (j !== i) {
         const tmp = points[i];
@@ -545,7 +549,7 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
         points[j] = tmp;
       }
     }
-    points.length = CAP;
+    points.length = K;
   }
 
   return points;
@@ -572,8 +576,13 @@ function inferShapeSource(url) {
 /**
  * Load an external SVG file and rasterize it into particle points.
  * Returns a promise that resolves to an array of {x, y} points.
+ *
+ * `maxPoints` is the hard cap; callers pass the particle-budget so the
+ * output is ALREADY a uniform sample sized to fit. This is the primary
+ * defense against the slicing class of bug — downstream consumers can
+ * safely walk the prefix knowing it's uniform.
  */
-export async function loadExternalShape(url, resolution = 300) {
+export async function loadExternalShape(url, resolution = 300, maxPoints = 30000) {
   try {
     const response = await fetch(url);
     const svgText = await response.text();
@@ -600,11 +609,109 @@ export async function loadExternalShape(url, resolution = 300) {
     if (paths.length === 0) return null;
 
     const shapeSource = inferShapeSource(url);
-    return rasterizeFromPaths(paths, viewBox, resolution, shapeSource);
+    return rasterizeFromPaths(paths, viewBox, resolution, shapeSource, maxPoints);
   } catch (e) {
     console.warn('Failed to load external shape:', url, e);
     return null;
   }
+}
+
+/**
+ * Rasterize a text string into particle points using the Canvas text API.
+ * Returns points normalized to [0, 1] × [0, 1] — same format as
+ * rasterizeFromPaths — so it plugs into the same downstream machinery
+ * (spring physics, target-based rendering, contract asserts).
+ *
+ * Used to build the "Thinking Canvas" particle title. The title is
+ * rasterized once at canvas size, then scaled to the visible area just
+ * like any shape.
+ *
+ * @param {string} text - The text to rasterize.
+ * @param {object} opts
+ * @param {number} opts.resolution - Width (in px) of the offscreen scratch
+ *   bitmap. Taller content is auto-scaled to fit. 600 is a good default
+ *   for titles.
+ * @param {string} opts.font - CSS font shorthand (e.g. `"bold 72px 'Inter', -apple-system, sans-serif"`).
+ * @param {number} opts.maxPoints - Hard cap on returned points. Caller should
+ *   pass the particle budget for the title to stay within.
+ * @returns {Array<{x:number,y:number}>|null} Normalized point cloud, or null
+ *   on empty string / font-measure failure.
+ */
+export function rasterizeText(text, opts = {}) {
+  const resolution = opts.resolution || 600;
+  const font = opts.font || "bold 72px 'Inter', -apple-system, 'SF Pro Display', sans-serif";
+  const maxPoints = opts.maxPoints || 30000;
+
+  if (!text || typeof text !== 'string') return null;
+
+  // First pass: measure text at the requested font so we can size the
+  // bitmap tightly. Browser measureText() returns width; we approximate
+  // height from the font-size token.
+  const measureCanvas = document.createElement('canvas');
+  const measureCtx = measureCanvas.getContext('2d');
+  measureCtx.font = font;
+  const metrics = measureCtx.measureText(text);
+  const textWidth = Math.ceil(metrics.width);
+  // Most browsers expose actualBoundingBox* in modern versions. Fall back
+  // to a heuristic if missing.
+  const ascent = metrics.actualBoundingBoxAscent || 56;
+  const descent = metrics.actualBoundingBoxDescent || 16;
+  const textHeight = Math.ceil(ascent + descent);
+
+  if (textWidth <= 0 || textHeight <= 0) return null;
+
+  // Pad so anti-aliased edges aren't clipped.
+  const padding = 8;
+  const bitmapW = textWidth + padding * 2;
+  const bitmapH = textHeight + padding * 2;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmapW;
+  canvas.height = bitmapH;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = 'white';
+  ctx.font = font;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(text, padding, padding + ascent);
+
+  // Scan pixels, collect filled positions, and normalize to [0,1] × [0,1].
+  const imageData = ctx.getImageData(0, 0, bitmapW, bitmapH);
+  const data = imageData.data;
+  const points = [];
+  for (let y = 0; y < bitmapH; y++) {
+    for (let x = 0; x < bitmapW; x++) {
+      const i = (y * bitmapW + x) * 4;
+      if (data[i + 3] > 128) {
+        points.push({ x: x / bitmapW, y: y / bitmapH });
+      }
+    }
+  }
+
+  if (points.length === 0) return null;
+
+  // Uniform-sample down to maxPoints using the same pattern as
+  // rasterizeFromPaths. Title glyphs produce a lot of edge pixels; the
+  // scanline-ordered prefix would slice the baseline off, which would be
+  // visually catastrophic.
+  if (points.length > maxPoints) {
+    const n = points.length;
+    const K = maxPoints;
+    for (let i = 0; i < K; i++) {
+      const j = i + Math.floor(Math.random() * (n - i));
+      if (j !== i) {
+        const tmp = points[i];
+        points[i] = points[j];
+        points[j] = tmp;
+      }
+    }
+    points.length = K;
+  }
+
+  // Expose the aspect ratio so callers can lay the title out without
+  // distorting letterforms.
+  points.aspectRatio = bitmapW / bitmapH;
+  return points;
 }
 
 /**

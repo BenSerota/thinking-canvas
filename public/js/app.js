@@ -1,26 +1,40 @@
 /**
  * Orchestrator — ties together the Thinking Canvas, Chat Panel, and AI backend
  *
- * Three visual states:
- * 1. Idle — particles drift ambient
- * 2. Thinking — hurricane vortex while LLM reasons
- * 3. Forming — shapes materialize from Haiku-extracted concepts
+ * Lifecycle per turn:
+ * 1. Page load: particle-typography title shows ("Thinking Canvas"), ambient
+ *    hurricane drifts underneath.
+ * 2. User sends: title dissolves into gathering → thinking → hurricane ramps up.
+ * 3. Shapes stream in one-by-one (crossfade): viewer sees Claude's "current
+ *    thought" as each concept arrives.
+ * 4. concepts_done: all streamed shapes arrange side-by-side and rotate slowly
+ *    in place. Free particles orbit each shape as its own mini-hurricane.
+ * 5. Next user message: everything dissolves back to the hurricane. Repeat.
  */
 
-import { ThinkingCanvas } from './canvas.js';
+import { ThinkingCanvas, getShapeParticleBudget } from './canvas.js';
 import { ChatPanel } from './chat.js';
-import { rasterizeShape, loadExternalShape, conceptToShape, getAvailableShapes } from './shapes.js';
+import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape, getAvailableShapes } from './shapes.js';
 
 class App {
   constructor() {
     this.canvas = new ThinkingCanvas(document.getElementById('thinkingCanvas'));
     this.chat = new ChatPanel(document.getElementById('chatPanel'), (msg) => this.handleUserMessage(msg));
     this.shapeCache = {};
+    // Shapes accumulated during the current turn — used for the side-by-side
+    // view once concepts_done arrives.
+    this.turnShapes = [];
     this.currentConcepts = [];
     this.conceptIndex = 0;
     this.conceptTimer = null;
 
+    // Turn counter — turn 1 is pure crossfade (the dramatic intro to the
+    // shape metaphor). Turn 2+ gets crossfade during streaming, then the
+    // carousel arrangement at concepts_done.
+    this.turnsCompleted = 0;
+
     this._precacheShapes();
+    this._showTitle();
 
     setTimeout(() => {
       this.chat.addMessage('assistant',
@@ -31,17 +45,43 @@ class App {
 
   _precacheShapes() {
     const shapes = getAvailableShapes();
+    const budget = getShapeParticleBudget();
     for (const name of shapes) {
-      this.shapeCache[name] = rasterizeShape(name);
+      this.shapeCache[name] = rasterizeShape(name, 300, budget);
+    }
+  }
+
+  /**
+   * Rasterize the "Thinking Canvas" title into particle targets and hand it
+   * to the canvas. Runs on page load and sets the canvas initial state to
+   * 'title-idle' with ambient hurricane drifting underneath.
+   */
+  _showTitle() {
+    // Budget the title at ~35% of shape particles so the hurricane underneath
+    // has ample free particles to swirl with.
+    const titleBudget = Math.floor(getShapeParticleBudget() * 0.35);
+    // Thin serif reads as elegant rather than blocky when rasterized to
+    // particles (the particle pass thickens strokes further because every
+    // AA pixel above alpha 128 becomes a cluster). Weight 300, Garamond-
+    // family fallback stack ends at Georgia for ubiquitous availability.
+    const points = rasterizeText('Thinking Canvas', {
+      font: "300 56px 'Cormorant Garamond', 'EB Garamond', 'Didot', 'Didot LT STD', Georgia, serif",
+      maxPoints: titleBudget,
+    });
+    if (points) {
+      this.canvas.setTitle(points, 'Thinking Canvas');
+    } else {
+      console.warn('[app] Title rasterization failed — falling back to idle state');
     }
   }
 
   async handleUserMessage(text) {
     this.chat.setInputEnabled(false);
 
-    // State 1 → 2: Gathering, then thinking when LLM starts reasoning
+    // Release all particles (including title) into the gathering → hurricane.
     this.canvas.setState('gathering');
     this._clearConceptCycle();
+    this.turnShapes = [];  // fresh for this turn
 
     try {
       const response = await fetch('/api/chat/stream', {
@@ -77,7 +117,6 @@ class App {
 
           switch (data.type) {
             case 'thinking':
-              // Show thinking text in collapsible UI + enter hurricane state
               this.chat.addThinkingMessage(data.text);
               this.canvas.setState('thinking');
               break;
@@ -85,13 +124,15 @@ class App {
             case 'concept_resolved':
               // Per-shape streaming: render the FIRST arrival immediately so
               // the canvas starts forming while shapes 2-3 are still resolving
-              // on the server (potentially including slow svg-generator calls).
-              if (data.shape) this._onConceptResolved(data.shape);
+              // on the server.
+              if (data.shape) await this._onConceptResolved(data.shape);
               break;
 
             case 'concepts_done':
-              // Terminal marker — all shapes have arrived. The rotation timer
-              // was started on the second arrival; nothing to do here.
+              // Terminal marker — all shapes have arrived. If we collected
+              // 2+ shapes, switch from single-shape crossfade to side-by-side
+              // multi-shape view.
+              await this._onConceptsDone();
               break;
 
             case 'concepts':
@@ -123,13 +164,22 @@ class App {
   }
 
   /**
-   * Handle a single concept_resolved SSE event. Renders the first shape
-   * immediately, then appends later shapes and starts the 4-s rotation timer
-   * on the second arrival.
+   * Handle a single concept_resolved SSE event. During streaming, shapes
+   * still crossfade one-by-one (that's the dramatic beat — viewer sees each
+   * thought take shape in turn). We also collect them into turnShapes so
+   * concepts_done can flip into side-by-side.
    */
-  _onConceptResolved(shape) {
+  async _onConceptResolved(shape) {
+    // Resolve the shape's points ONCE — we'll need them again for the
+    // side-by-side switch. Cache on the shape object.
+    const points = await this._resolvePoints(shape);
+    if (!points) return;
+
+    shape._points = points;  // attach for _onConceptsDone to reuse
+    this.turnShapes.push(shape);
+
+    // Crossfade behavior during streaming, same as before.
     if (this.currentConcepts.length === 0) {
-      // First arrival — drop thinking state, render this shape now
       this.canvas.interimMode = false;
       this._clearConceptCycle();
       this.currentConcepts = [shape];
@@ -140,13 +190,72 @@ class App {
 
     this.currentConcepts.push(shape);
 
-    // Start rotation timer the moment we have 2 shapes to cycle between
+    // Rotate through shapes while we wait for concepts_done.
     if (this.currentConcepts.length === 2 && !this.conceptTimer) {
       this.conceptTimer = setInterval(() => {
         this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
         this._showCurrentConcept('crossfade');
       }, 4000);
     }
+  }
+
+  /**
+   * All shapes for this turn have arrived. Stop the crossfade rotation and
+   * switch to side-by-side multi-shape view (if 2+ shapes).
+   */
+  async _onConceptsDone() {
+    this._clearConceptCycle();
+
+    // Turn 1 is pure crossfade — keep the shapes cycling through the center
+    // via the existing conceptTimer. Turn 2+ switches to the carousel so
+    // the viewer can see all three together once they've seen each one
+    // individually in the first exchange.
+    if (this.turnShapes.length >= 2 && this.turnsCompleted >= 1) {
+      const shapesForCanvas = this.turnShapes
+        .filter(s => s._points && s._points.length > 0)
+        .map(s => ({
+          points: s._points,
+          label: s.concept || s.name,
+        }));
+      if (shapesForCanvas.length >= 2) {
+        // Carousel replaces the crossfade — stop the cycle timer so the
+        // canvas isn't also trying to swap shapes under us.
+        this._clearConceptCycle();
+        this.canvas.setShapes(shapesForCanvas);
+      }
+    }
+
+    this.turnsCompleted++;
+  }
+
+  /**
+   * Resolve a shape info object to its particle point cloud.
+   * Factored out of _showCurrentConcept so _onConceptResolved can
+   * pre-resolve for later reuse in setShapes.
+   */
+  async _resolvePoints(info) {
+    let points = null;
+
+    if (info.dynamic) {
+      const cacheKey = info.dynamic;
+      if (this.shapeCache[cacheKey]) {
+        points = this.shapeCache[cacheKey];
+      } else {
+        points = await loadExternalShape(info.dynamic, 300, getShapeParticleBudget());
+        if (points) this.shapeCache[cacheKey] = points;
+      }
+    }
+
+    if (!points) {
+      const shapeName = conceptToShape(info.name);
+      points = this.shapeCache[shapeName];
+      if (!points) {
+        points = rasterizeShape(shapeName, 300, getShapeParticleBudget());
+        if (points) this.shapeCache[shapeName] = points;
+      }
+    }
+
+    return points;
   }
 
   /**
@@ -171,36 +280,11 @@ class App {
     const info = this.currentConcepts[this.conceptIndex];
     if (!info) return;
 
-    let points = null;
+    const points = info._points || await this._resolvePoints(info);
+    if (!points) return;
 
-    // Try dynamic SVG first — use cached rasterization if we've seen this URL before
-    if (info.dynamic) {
-      const cacheKey = info.dynamic;
-      if (this.shapeCache[cacheKey]) {
-        points = this.shapeCache[cacheKey];
-      } else {
-        points = await loadExternalShape(info.dynamic);
-        if (points) this.shapeCache[cacheKey] = points;
-      }
-    }
-
-    // Fall back to built-in shape
-    if (!points) {
-      const shapeName = conceptToShape(info.name);
-      points = this.shapeCache[shapeName];
-      if (!points) {
-        points = rasterizeShape(shapeName);
-        if (points) this.shapeCache[shapeName] = points;
-      }
-    }
-
-    if (points) {
-      // Label = Haiku's original iconic phrase (e.g. "basketball hoop") when
-      // available, falling back to the matched filename. This is what
-      // surfaces on the canvas as the small label at the bottom.
-      const label = info.concept || info.name;
-      this.canvas.setShape(points, label, transition);
-    }
+    const label = info.concept || info.name;
+    this.canvas.setShape(points, label, transition);
   }
 
   _clearConceptCycle() {
@@ -208,8 +292,6 @@ class App {
       clearInterval(this.conceptTimer);
       this.conceptTimer = null;
     }
-    // Reset collected concepts so the first concept_resolved of the next
-    // message triggers the "first arrival" render path.
     this.currentConcepts = [];
     this.conceptIndex = 0;
   }
