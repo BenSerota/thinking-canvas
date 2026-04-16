@@ -171,6 +171,36 @@ export class ThinkingCanvas {
     const particleCount = this.particles.length;
     const shapeParticleCount = Math.min(scaledPoints.length, Math.floor(particleCount * SHAPE_PARTICLE_RATIO));
 
+    // Uniform-sample scaledPoints down to shapeParticleCount before assignment.
+    // shapePoints arrive from rasterizeFromPaths in scanline order (top-to-
+    // bottom, left-to-right). The loop below uses `scaledPoints[i % len]`,
+    // which, when there are more rasterized points than available particles,
+    // just walks the FIRST shapeParticleCount entries — i.e. only the top
+    // scanlines. The shape's bottom half gets silently dropped.
+    //
+    // This matters for icons that rasterize to dense point sets. Our 12k
+    // particles × 0.85 shape-ratio = 10,200 slots; many Iconify icons produce
+    // 18k–28k points after 3× edge weighting. FA Solid icons (denser, coarser
+    // silhouettes) usually fit under 10,200, which is why this latent bug
+    // didn't manifest before we started fetching from 150+ other icon sets.
+    //
+    // Same failure mode and same fix as the rasterizeFromPaths Fisher-Yates
+    // in shapes.js:538–549. A partial shuffle that moves samples to the FRONT
+    // of the array yields a uniform K-sample of the N points.
+    if (scaledPoints.length > shapeParticleCount) {
+      const K = shapeParticleCount;
+      const N = scaledPoints.length;
+      for (let i = 0; i < K; i++) {
+        const j = i + Math.floor(Math.random() * (N - i));
+        if (j !== i) {
+          const tmp = scaledPoints[i];
+          scaledPoints[i] = scaledPoints[j];
+          scaledPoints[j] = tmp;
+        }
+      }
+      scaledPoints.length = K;
+    }
+
     const indices = [...Array(particleCount).keys()];
     for (let i = indices.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
