@@ -255,8 +255,15 @@ export class ThinkingCanvas {
       this.state = 'transitioning';
       for (const p of this.particles) {
         if (p.targetX !== null) {
-          p.vx += (Math.random() - 0.5) * 1.5;
-          p.vy += (Math.random() - 0.5) * 1.5;
+          // Give shape particles an outward scatter kick…
+          p.vx += (Math.random() - 0.5) * 4;
+          p.vy += (Math.random() - 0.5) * 4;
+          // …then release them from the spring entirely so they actually
+          // drift. Without nulling targets here, spring physics (SPRING_K)
+          // immediately cancels the kick and the shape stays frozen.
+          p.targetX = null;
+          p.targetY = null;
+          p.isShapeParticle = false;
         }
       }
       setTimeout(doAssign, 200);
@@ -676,6 +683,13 @@ export class ThinkingCanvas {
     if (inCarousel) {
       this.carouselAngle += SHAPE_ROTATION_SPEED;
     }
+
+    // During the 200ms crossfade scatter window, do NOT write targets.
+    // setShape kicked all particles with a small velocity impulse so they
+    // scatter; if we keep overwriting targetX/Y to the old shape's
+    // basePoints here, the spring drags them straight back and the old
+    // shape never actually disappears.
+    if (this.state === 'transitioning') return;
 
     const canvasCx = this.width / 2;
     const canvasCy = this.height / 2;
