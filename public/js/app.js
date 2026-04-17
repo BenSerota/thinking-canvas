@@ -16,6 +16,12 @@ import { ThinkingCanvas, getShapeParticleBudget } from './canvas.js';
 import { ChatPanel } from './chat.js';
 import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape, getAvailableShapes } from './shapes.js';
 
+// How long each shape stays on screen during the crossfade cycle (ms).
+// Also the pause before/after the carousel swap. 2s is the sweet spot —
+// long enough to register the silhouette and label, short enough that 3
+// shapes cycle in ~6s before the group view.
+const CYCLE_MS = 2000;
+
 class App {
   constructor() {
     this.canvas = new ThinkingCanvas(document.getElementById('thinkingCanvas'));
@@ -27,11 +33,6 @@ class App {
     this.currentConcepts = [];
     this.conceptIndex = 0;
     this.conceptTimer = null;
-
-    // Turn counter — turn 1 is pure crossfade (the dramatic intro to the
-    // shape metaphor). Turn 2+ gets crossfade during streaming, then the
-    // carousel arrangement at concepts_done.
-    this.turnsCompleted = 0;
 
     this._precacheShapes();
     this._showTitle();
@@ -57,16 +58,19 @@ class App {
    * 'title-idle' with ambient hurricane drifting underneath.
    */
   _showTitle() {
-    // Budget the title at ~35% of shape particles so the hurricane underneath
-    // has ample free particles to swirl with.
-    const titleBudget = Math.floor(getShapeParticleBudget() * 0.35);
-    // Thin serif reads as elegant rather than blocky when rasterized to
-    // particles (the particle pass thickens strokes further because every
-    // AA pixel above alpha 128 becomes a cluster). Weight 300, Garamond-
-    // family fallback stack ends at Georgia for ubiquitous availability.
+    const titleBudget = Math.floor(getShapeParticleBudget() * 0.25);
+    // Helvetica Neue Thin (weight 200) has more stroke area than UltraLight
+    // (100) — UltraLight at 72px is so thin that raising alphaThreshold
+    // above the AA fringe drops almost every pixel, and the title becomes
+    // unreadable particle-dust. Thin + threshold 160 keeps the stroke body
+    // while dropping the softest edge pixels — the result reads as a
+    // genuinely hair-thin face, not a padded one. Larger size (84px) gives
+    // a few extra pixels of stroke width so letterforms survive the
+    // threshold filter. Upright (no italic) for a cleaner, Swiss feel.
     const points = rasterizeText('Thinking Canvas', {
-      font: "300 56px 'Cormorant Garamond', 'EB Garamond', 'Didot', 'Didot LT STD', Georgia, serif",
+      font: "200 84px 'Helvetica Neue', 'Avenir Next', -apple-system, sans-serif",
       maxPoints: titleBudget,
+      alphaThreshold: 160,
     });
     if (points) {
       this.canvas.setTitle(points, 'Thinking Canvas');
@@ -190,42 +194,87 @@ class App {
 
     this.currentConcepts.push(shape);
 
-    // Rotate through shapes while we wait for concepts_done.
+    // Rotate through shapes while we wait for concepts_done. 2s per shape
+    // is snappy enough to feel responsive without flicker.
     if (this.currentConcepts.length === 2 && !this.conceptTimer) {
       this.conceptTimer = setInterval(() => {
         this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
         this._showCurrentConcept('crossfade');
-      }, 4000);
+      }, CYCLE_MS);
     }
   }
 
   /**
-   * All shapes for this turn have arrived. Stop the crossfade rotation and
-   * switch to side-by-side multi-shape view (if 2+ shapes).
+   * All shapes for this turn have arrived. Every turn follows the same
+   * two-phase arc: (1) cycle through each remaining unshown shape at 2s
+   * intervals so the viewer sees every concept individually, (2) then
+   * arrange all shapes on the circular carousel together.
+   *
+   * If the server resolves shapes quickly, most still haven't been shown
+   * by the time this fires — so we step through them here before the
+   * carousel, rather than immediately swapping to the group view.
    */
   async _onConceptsDone() {
-    this._clearConceptCycle();
+    const allShapes = this.turnShapes.filter(s => s._points && s._points.length > 0);
 
-    // Turn 1 is pure crossfade — keep the shapes cycling through the center
-    // via the existing conceptTimer. Turn 2+ switches to the carousel so
-    // the viewer can see all three together once they've seen each one
-    // individually in the first exchange.
-    if (this.turnShapes.length >= 2 && this.turnsCompleted >= 1) {
-      const shapesForCanvas = this.turnShapes
-        .filter(s => s._points && s._points.length > 0)
-        .map(s => ({
-          points: s._points,
-          label: s.concept || s.name,
-        }));
-      if (shapesForCanvas.length >= 2) {
-        // Carousel replaces the crossfade — stop the cycle timer so the
-        // canvas isn't also trying to swap shapes under us.
-        this._clearConceptCycle();
-        this.canvas.setShapes(shapesForCanvas);
-      }
+    if (allShapes.length < 2) {
+      // Nothing to arrange — single (or zero) shape, just stop cycling.
+      this._clearConceptCycle();
+      return;
     }
 
-    this.turnsCompleted++;
+    // Make sure currentConcepts has the full set (shapes added after the
+    // timer started would already be here, but guard against races).
+    for (const s of allShapes) {
+      if (!this.currentConcepts.includes(s)) this.currentConcepts.push(s);
+    }
+
+    // Stop the current timer — we're about to replace it with a finite
+    // stepper that knows how many shapes remain.
+    if (this.conceptTimer) {
+      clearInterval(this.conceptTimer);
+      this.conceptTimer = null;
+    }
+
+    const shapesForCarousel = allShapes.map(s => ({
+      points: s._points,
+      label: s.concept || s.name,
+    }));
+
+    // How many shapes are still unshown? Cycle through them, then carousel.
+    const stepsLeft = allShapes.length - this.conceptIndex - 1;
+    this._scheduleCarousel(shapesForCarousel, stepsLeft);
+  }
+
+  /**
+   * Step through any unshown shapes at CYCLE_MS intervals, then call
+   * `setShapes` to arrange them all on the circular carousel.
+   */
+  _scheduleCarousel(shapesForCarousel, stepsLeft) {
+    const launch = () => {
+      this._clearConceptCycle();
+      this.canvas.setShapes(shapesForCarousel);
+    };
+
+    if (stepsLeft <= 0) {
+      // Everything already shown — brief pause on the last shape, then
+      // fan them out onto the ring.
+      setTimeout(launch, CYCLE_MS);
+      return;
+    }
+
+    let remaining = stepsLeft;
+    this.conceptTimer = setInterval(() => {
+      this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
+      this._showCurrentConcept('crossfade');
+      remaining--;
+      if (remaining <= 0) {
+        clearInterval(this.conceptTimer);
+        this.conceptTimer = null;
+        // Show the final shape for a moment, then carousel.
+        setTimeout(launch, CYCLE_MS);
+      }
+    }, CYCLE_MS);
   }
 
   /**
@@ -272,7 +321,7 @@ class App {
       this.conceptTimer = setInterval(() => {
         this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
         this._showCurrentConcept('crossfade');
-      }, 4000);
+      }, CYCLE_MS);
     }
   }
 

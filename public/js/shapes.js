@@ -641,6 +641,10 @@ export function rasterizeText(text, opts = {}) {
   const resolution = opts.resolution || 600;
   const font = opts.font || "bold 72px 'Inter', -apple-system, 'SF Pro Display', sans-serif";
   const maxPoints = opts.maxPoints || 30000;
+  // Minimum pixel alpha to count as filled. Default 128 captures anti-aliased
+  // edges — makes titles look bold/padded. Callers wanting a thin, clean
+  // letterform can raise this (e.g. 200) to pick only stroke cores.
+  const alphaThreshold = opts.alphaThreshold ?? 128;
 
   if (!text || typeof text !== 'string') return null;
 
@@ -682,7 +686,7 @@ export function rasterizeText(text, opts = {}) {
   for (let y = 0; y < bitmapH; y++) {
     for (let x = 0; x < bitmapW; x++) {
       const i = (y * bitmapW + x) * 4;
-      if (data[i + 3] > 128) {
+      if (data[i + 3] > alphaThreshold) {
         points.push({ x: x / bitmapW, y: y / bitmapH });
       }
     }

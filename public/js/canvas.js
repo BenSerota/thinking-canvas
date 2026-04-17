@@ -248,7 +248,8 @@ export class ThinkingCanvas {
       this._assignShapeToParticles([singleShape]);
       this.currentShapes = [singleShape];
       this.state = 'forming';
-      this.transitionProgress = 0;
+      // Start at 1 so the label is visible immediately — no fade-in delay.
+      this.transitionProgress = 1;
     };
 
     if (transition === 'crossfade' && this.state === 'forming') {
