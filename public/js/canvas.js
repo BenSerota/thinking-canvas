@@ -237,7 +237,7 @@ export class ThinkingCanvas {
    * Set a single shape centered on the canvas. Used during streaming
    * (crossfade behavior) before all shapes for a turn have arrived.
    */
-  setShape(shapePoints, label, transition = 'instant') {
+  setShape(shapePoints, label, transition = 'instant', animationOpts = null) {
     if (!shapePoints || shapePoints.length === 0) {
       this.clearShape();
       return;
@@ -245,6 +245,9 @@ export class ThinkingCanvas {
 
     const doAssign = () => {
       const singleShape = this._buildShape(shapePoints, label, this.width / 2, this.height / 2, 1.0);
+      if (animationOpts) {
+        this._attachAnimation(singleShape, animationOpts, this.width / 2, this.height / 2, 1.0);
+      }
       this._assignShapeToParticles([singleShape]);
       this.currentShapes = [singleShape];
       this.state = 'forming';
@@ -308,13 +311,16 @@ export class ThinkingCanvas {
 
     const shapes = [];
     for (let i = 0; i < n; i++) {
-      const { points, label } = shapesPointsAndLabels[i];
+      const { points, label, animation } = shapesPointsAndLabels[i];
       // centerX/centerY will be updated every frame in _applyShapeRotation;
       // seed them at the t=0 position so the very first frame doesn't see
       // stale values.
       const cx = this.width / 2 + orbitRadius * Math.cos(phases[i]);
       const cy = this.height / 2 + orbitRadius * Math.sin(phases[i]);
       const shape = this._buildShape(points, label, cx, cy, perShapeScale);
+      if (animation) {
+        this._attachAnimation(shape, animation, cx, cy, perShapeScale);
+      }
       shape.orbitRadius = orbitRadius;
       shape.orbitPhase = phases[i];
       shapes.push(shape);
@@ -368,7 +374,60 @@ export class ThinkingCanvas {
       orbitPhase: 0,
       basePoints,
       particleIndices: [],
+      // Animation fields (null = static shape)
+      animationFrames: null,
+      animationFps: 0,
+      animationTime: 0,
+      currentFrameIdx: 0,
     };
+  }
+
+  /**
+   * Pre-compute all animation frames in canvas-space and attach them to a
+   * shape descriptor. Each frame is transformed identically to how _buildShape
+   * transforms basePoints, so frame-swaps are spatially consistent.
+   */
+  _attachAnimation(shape, animOpts, centerX, centerY, scaleFactor) {
+    if (!animOpts || !animOpts.frames || animOpts.frames.length < 2) return;
+
+    const margin = 60;
+    const shapeW = this.width - margin * 2;
+    const shapeH = this.height - margin * 2;
+    const fullScale = Math.min(shapeW, shapeH) * 0.7;
+    const scale = fullScale * scaleFactor;
+
+    // Compute a global bbox across ALL frames for consistent centering
+    let gMinX = 1, gMaxX = 0, gMinY = 1, gMaxY = 0;
+    for (const frame of animOpts.frames) {
+      for (const p of frame) {
+        if (p.x < gMinX) gMinX = p.x;
+        if (p.x > gMaxX) gMaxX = p.x;
+        if (p.y < gMinY) gMinY = p.y;
+        if (p.y > gMaxY) gMaxY = p.y;
+      }
+    }
+    const gcx = (gMinX + gMaxX) / 2;
+    const gcy = (gMinY + gMaxY) / 2;
+
+    shape.animationFrames = animOpts.frames.map(frame =>
+      frame.map(p => ({
+        x: centerX + (p.x - gcx) * scale,
+        y: centerY + (p.y - gcy) * scale,
+      }))
+    );
+    shape.animationFps = Math.min(animOpts.fps || 5, 5);
+    shape.animationTime = 0;
+    shape.currentFrameIdx = 0;
+    shape.animationOriginX = centerX;
+    shape.animationOriginY = centerY;
+    shape.staticPointCount = animOpts.staticCount || 0;
+
+    // Sync initial basePoints with animation frame 0 so both use the same
+    // global-bbox transform. _buildShape uses frame-0-only bbox centering,
+    // which differs when dynamic elements (electrons) extend the global bbox
+    // in other frames. Without this, static particles sit at _buildShape
+    // positions while dynamic particles jump to _attachAnimation positions.
+    shape.basePoints = shape.animationFrames[0].map(p => ({ x: p.x, y: p.y }));
   }
 
   /**
@@ -561,15 +620,18 @@ export class ThinkingCanvas {
     const springDamp = this.interimMode ? 0.92 : SPRING_DAMPING;
     const intensity = this.hurricaneIntensity;
 
-    // Target hurricane radius. In the settled multi-shape carousel, the
-    // ring needs to ENCOMPASS all the shapes — so it expands to
-    // orbitRadius + shape bbox margin. In every other state, the default
-    // tight ring (~120px, pulsing) is what we want.
+    // Target hurricane radius. The ring must ENCOMPASS whatever shapes
+    // are on screen — it should never overlap or cut through them.
     let baseRadius = 120;
-    if (this.state === 'settled' && this.currentShapes.length > 1) {
-      const firstOrbiting = this.currentShapes.find(s => s.orbitRadius > 0);
-      if (firstOrbiting) {
-        baseRadius = firstOrbiting.orbitRadius + firstOrbiting.bboxMax * 0.8;
+    if ((this.state === 'forming' || this.state === 'settled') && this.currentShapes.length > 0) {
+      if (this.currentShapes.length === 1 && !this.currentShapes[0].isTitle) {
+        // Single shape: push the ring outside the shape's bounding box
+        baseRadius = this.currentShapes[0].bboxMax * 0.6 + 50;
+      } else if (this.currentShapes.length > 1) {
+        const firstOrbiting = this.currentShapes.find(s => s.orbitRadius > 0);
+        if (firstOrbiting) {
+          baseRadius = firstOrbiting.orbitRadius + firstOrbiting.bboxMax * 0.8;
+        }
       }
     }
     const targetRadius = baseRadius + Math.sin(this.time * 1.5) * 30;
@@ -588,11 +650,11 @@ export class ThinkingCanvas {
         if (mDist < CURSOR_RADIUS && mDist > 1) {
           const force = (CURSOR_RADIUS - mDist) / CURSOR_RADIUS;
           if (this.mouseDown) {
-            p.vx -= (mdx / mDist) * force * CURSOR_ATTRACT_FORCE;
-            p.vy -= (mdy / mDist) * force * CURSOR_ATTRACT_FORCE;
-          } else {
             p.vx += (mdx / mDist) * force * force * CURSOR_REPEL_FORCE;
             p.vy += (mdy / mDist) * force * force * CURSOR_REPEL_FORCE;
+          } else {
+            p.vx -= (mdx / mDist) * force * CURSOR_ATTRACT_FORCE;
+            p.vy -= (mdy / mDist) * force * CURSOR_ATTRACT_FORCE;
           }
         }
       }
@@ -729,6 +791,30 @@ export class ThinkingCanvas {
         for (const bp of shape.basePoints) {
           bp.x += dx;
           bp.y += dy;
+        }
+      }
+
+      // Animation frame cycling: swap basePoints to the next frame when
+      // enough time has elapsed.
+      if (shape.animationFrames && shape.animationFrames.length > 1) {
+        if (shape.animationTime === 0) {
+          console.log(`[canvas] animation active: ${shape.animationFrames.length} frames, ${shape.animationFps}fps, static=${shape.staticPointCount}, label="${shape.label}"`);
+        }
+        shape.animationTime += 1 / 60;
+        const newIdx = Math.floor(shape.animationTime * shape.animationFps) % shape.animationFrames.length;
+        if (newIdx !== shape.currentFrameIdx) {
+          shape.currentFrameIdx = newIdx;
+          const ox = shape.centerX - (shape.animationOriginX || shape.centerX);
+          const oy = shape.centerY - (shape.animationOriginY || shape.centerY);
+          const newFrame = shape.animationFrames[newIdx];
+          // Only retarget the dynamic portion (after staticPointCount).
+          // Static points (nucleus, orbit rings) are identical across frames
+          // so their particles stay locked in place.
+          const sc = shape.staticPointCount || 0;
+          for (let i = sc; i < shape.basePoints.length && i < newFrame.length; i++) {
+            shape.basePoints[i].x = newFrame[i].x + ox;
+            shape.basePoints[i].y = newFrame[i].y + oy;
+          }
         }
       }
 

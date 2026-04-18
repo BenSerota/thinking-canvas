@@ -24,7 +24,7 @@ const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'library-embeddings.json');
 // cache without manual cleanup. Kept in sync with svg-generator.js
 // GENERATED_SUBDIR constant; changing the version there requires bumping
 // PROMPT_VERSION and the old files become dead weight on disk (safe to delete).
-const GENERATED_DIR = path.join(ROOT, 'public', 'shapes', 'generated-v2');
+const GENERATED_DIR = path.join(ROOT, 'public', 'shapes', 'generated-v3');
 
 const DEFAULT_THRESHOLD = 0.55;
 

@@ -21,3 +21,6 @@ public/shapes/generated-*/
 # Runtime-fetched SVGs from api.iconify.design. Safe to wipe; will re-fetch on
 # demand. Keyed by the user-concept kebab, not the Iconify icon name.
 public/shapes/iconify-cache/
+
+# Runtime-fetched Lottie animations from LottieFiles API. Safe to wipe.
+public/shapes/lottie-cache/

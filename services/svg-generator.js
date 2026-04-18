@@ -44,7 +44,8 @@ const iconMatcher = require('./icon-matcher');
 const embeddingService = require('./embedding-service');
 
 // Prompt version — bump when prompt changes semantics so the old cache is bypassed.
-const PROMPT_VERSION = 'v2';
+// v3: upgraded to Opus 4.7 (Sonnet 4.6 fallback) for much better silhouette quality.
+const PROMPT_VERSION = 'v3';
 const GENERATED_SUBDIR = `generated-${PROMPT_VERSION}`;
 
 const ROOT = path.resolve(__dirname, '..');
@@ -57,6 +58,9 @@ if (!fs.existsSync(GENERATED_DIR)) {
 }
 
 const anthropic = new Anthropic();
+
+const PRIMARY_MODEL = 'claude-opus-4-7';
+const FALLBACK_MODEL = 'claude-sonnet-4-6';
 
 // Concurrency + negative cache
 let inFlight = null;
@@ -289,12 +293,18 @@ async function generate(iconic) {
 
   inFlight = (async () => {
     try {
-      const resp = await anthropic.messages.create({
-        model: 'claude-sonnet-4-5-20250929',
+      let resp;
+      const reqParams = {
         max_tokens: 3000,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: USER_PROMPT_TEMPLATE(iconic) }],
-      });
+      };
+      try {
+        resp = await anthropic.messages.create({ model: PRIMARY_MODEL, ...reqParams });
+      } catch (primaryErr) {
+        console.warn(`[svg-gen] ${PRIMARY_MODEL} failed, falling back to ${FALLBACK_MODEL}:`, primaryErr.message);
+        resp = await anthropic.messages.create({ model: FALLBACK_MODEL, ...reqParams });
+      }
 
       const raw = resp.content[0]?.text;
       if (!raw) return { ok: false, reason: 'empty response' };

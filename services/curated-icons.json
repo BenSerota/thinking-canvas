@@ -65,5 +65,65 @@
   "radio-tower": { "library": "tower-broadcast" },
   "antenna-tower": { "library": "tower-broadcast" },
 
-  "cell-tower": { "library": "tower-cell" }
+  "cell-tower": { "library": "tower-cell" },
+
+  "lightbulb": { "library": "lightbulb" },
+  "light-bulb": { "library": "lightbulb" },
+  "bulb": { "library": "lightbulb" },
+  "idea": { "library": "lightbulb" },
+
+  "volcano": { "library": "volcano" },
+  "eruption": { "library": "volcano" },
+  "volcanic-eruption": { "library": "volcano" },
+  "lava": { "library": "volcano" },
+
+  "atom": { "library": "atom" },
+  "atomic": { "library": "atom" },
+  "nucleus": { "library": "atom" },
+
+  "microscope": { "library": "microscope" },
+  "telescope": { "library": "microscope" },
+
+  "skull": { "library": "skull" },
+  "skeleton": { "library": "skull" },
+
+  "globe": { "library": "globe" },
+  "earth": { "library": "globe" },
+  "world": { "library": "globe" },
+
+  "crown": { "library": "crown" },
+  "shield": { "library": "shield" },
+  "sword": { "library": "swords" },
+
+  "rocket": { "library": "rocket" },
+  "spaceship": { "library": "rocket" },
+
+  "flag": { "library": "flag" },
+  "trophy": { "library": "trophy" },
+  "medal": { "library": "medal" },
+
+  "stethoscope": { "library": "stethoscope" },
+  "syringe": { "library": "syringe" },
+  "pill": { "library": "capsules" },
+
+  "drum": { "library": "drum" },
+  "microphone": { "library": "microphone" },
+
+  "camera": { "library": "camera" },
+  "film": { "library": "film" },
+
+  "anchor": { "library": "anchor" },
+  "compass": { "library": "compass" },
+
+  "graduation-cap": { "library": "graduation-cap" },
+  "diploma": { "library": "graduation-cap" },
+
+  "hourglass": { "library": "hourglass" },
+  "clock": { "library": "clock" },
+  "watch": { "library": "clock" },
+
+  "scale": { "library": "scale-balanced" },
+  "balance": { "library": "scale-balanced" },
+  "justice": { "library": "scale-balanced" },
+  "gavel": { "library": "gavel" }
 }

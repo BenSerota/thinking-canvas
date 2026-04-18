@@ -15,6 +15,7 @@
 import { ThinkingCanvas, getShapeParticleBudget } from './canvas.js';
 import { ChatPanel } from './chat.js';
 import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape, getAvailableShapes } from './shapes.js';
+import { loadLottieShape } from './lottie-rasterizer.js';
 
 // How long each shape stays on screen during the crossfade cycle (ms).
 // Also the pause before/after the carousel swap. 2s is the sweet spot —
@@ -176,10 +177,21 @@ class App {
   async _onConceptResolved(shape) {
     // Resolve the shape's points ONCE — we'll need them again for the
     // side-by-side switch. Cache on the shape object.
-    const points = await this._resolvePoints(shape);
-    if (!points) return;
+    const resolved = await this._resolvePoints(shape);
+    if (!resolved) return;
 
-    shape._points = points;  // attach for _onConceptsDone to reuse
+    // Animated shapes return a descriptor { isAnimated, frames, fps, points }.
+    // Static shapes return a plain point array. Normalize both into _points
+    // (first frame for display) and _animated (full animation data if present).
+    if (resolved.isAnimated) {
+      shape._points = resolved.points;
+      shape._animated = { frames: resolved.frames, fps: resolved.fps, staticCount: resolved.staticCount || 0 };
+    } else {
+      shape._points = resolved;
+      shape._animated = null;
+    }
+    const points = shape._points;
+    if (!points) return;
     this.turnShapes.push(shape);
 
     // Crossfade behavior during streaming, same as before.
@@ -239,6 +251,7 @@ class App {
     const shapesForCarousel = allShapes.map(s => ({
       points: s._points,
       label: s.concept || s.name,
+      animation: s._animated || null,
     }));
 
     // How many shapes are still unshown? Cycle through them, then carousel.
@@ -285,7 +298,28 @@ class App {
   async _resolvePoints(info) {
     let points = null;
 
-    if (info.dynamic) {
+    // Lottie animated shapes return a multi-frame descriptor instead of a
+    // flat point array. The descriptor has { isAnimated, frames, fps, points }.
+    if (info.type === 'lottie' && info.dynamic) {
+      const cacheKey = `lottie:${info.dynamic}`;
+      if (this.shapeCache[cacheKey]) return this.shapeCache[cacheKey];
+
+      const result = await loadLottieShape(info.dynamic, 300, getShapeParticleBudget(), 24);
+      if (result && result.frames.length > 0) {
+        const descriptor = {
+          isAnimated: true,
+          frames: result.frames,
+          fps: result.fps,
+          points: result.frames[0],
+          staticCount: result.staticCount || 0,
+        };
+        this.shapeCache[cacheKey] = descriptor;
+        return descriptor;
+      }
+      // Lottie rasterization failed — fall through to static pipeline
+    }
+
+    if (info.dynamic && !info.dynamic.endsWith('.json')) {
       const cacheKey = info.dynamic;
       if (this.shapeCache[cacheKey]) {
         points = this.shapeCache[cacheKey];
@@ -329,11 +363,22 @@ class App {
     const info = this.currentConcepts[this.conceptIndex];
     if (!info) return;
 
-    const points = info._points || await this._resolvePoints(info);
+    let points = info._points;
+    let animated = info._animated;
+    if (!points) {
+      const resolved = await this._resolvePoints(info);
+      if (!resolved) return;
+      if (resolved.isAnimated) {
+        points = resolved.points;
+        animated = { frames: resolved.frames, fps: resolved.fps };
+      } else {
+        points = resolved;
+      }
+    }
     if (!points) return;
 
     const label = info.concept || info.name;
-    this.canvas.setShape(points, label, transition);
+    this.canvas.setShape(points, label, transition, animated || null);
   }
 
   _clearConceptCycle() {

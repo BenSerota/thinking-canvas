@@ -18,12 +18,14 @@ const chatService = require('./services/chat-service');
 const shapeService = require('./services/shape-service');
 const conceptService = require('./services/concept-service'); // fallback only
 const iconMatcher = require('./services/icon-matcher');
+const emojiService = require('./services/emoji-service');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Warm up icon matcher at boot so first request doesn't pay the init cost
+// Warm up matchers at boot so first request doesn't pay the init cost
 iconMatcher.init().catch(err => console.warn('[server] iconMatcher init failed:', err.message));
+emojiService.init().catch(err => console.warn('[server] emojiService init failed:', err.message));
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));

@@ -1,0 +1,110 @@
+{
+  "atom": {
+    "file": "atom.json",
+    "fps": 30,
+    "frames": 90,
+    "tags": [
+      "atom",
+      "atomic",
+      "nucleus",
+      "electron",
+      "orbit",
+      "particle",
+      "physics"
+    ]
+  },
+  "heart": {
+    "file": "heart.json",
+    "fps": 30,
+    "frames": 60,
+    "tags": [
+      "heart",
+      "love",
+      "beat",
+      "pulse",
+      "valentine",
+      "cardio"
+    ]
+  },
+  "fire": {
+    "file": "fire.json",
+    "fps": 30,
+    "frames": 60,
+    "tags": [
+      "fire",
+      "flame",
+      "burning",
+      "blaze",
+      "inferno",
+      "heat"
+    ]
+  },
+  "globe": {
+    "file": "globe.json",
+    "fps": 30,
+    "frames": 120,
+    "tags": [
+      "globe",
+      "earth",
+      "world",
+      "planet",
+      "geography",
+      "sphere"
+    ]
+  },
+  "rocket": {
+    "file": "rocket.json",
+    "fps": 30,
+    "frames": 60,
+    "tags": [
+      "rocket",
+      "launch",
+      "space",
+      "spaceship",
+      "shuttle",
+      "takeoff"
+    ]
+  },
+  "lightning": {
+    "file": "lightning.json",
+    "fps": 30,
+    "frames": 60,
+    "tags": [
+      "lightning",
+      "thunder",
+      "electricity",
+      "bolt",
+      "storm",
+      "shock",
+      "energy"
+    ]
+  },
+  "dna": {
+    "file": "dna.json",
+    "fps": 30,
+    "frames": 90,
+    "tags": [
+      "dna",
+      "helix",
+      "genetics",
+      "chromosome",
+      "gene",
+      "biology",
+      "double-helix"
+    ]
+  },
+  "music-notes": {
+    "file": "music-notes.json",
+    "fps": 30,
+    "frames": 90,
+    "tags": [
+      "music",
+      "melody",
+      "song",
+      "note",
+      "notes",
+      "tune",
+      "musical"
+    ]
+  }
+}

@@ -17,7 +17,9 @@
 
 const iconMatcher = require('./icon-matcher');
 const iconifyService = require('./iconify-service');
+const emojiService = require('./emoji-service');
 const svgGenerator = require('./svg-generator');
+const lottieService = require('./lottie-service');
 const curatedIcons = require('./curated-icons.json');
 
 // Safety-net built-in shape names (must match keys in client shapes.js SHAPE_PATHS)
@@ -111,20 +113,80 @@ async function resolveVisual(visual) {
   const concept = iconic || builtinFallback;
 
   if (iconic) {
-    // 0. Hand-curated override — wins over both the matcher and the generator
-    // for concepts where the matcher picks the wrong icon or the generator
-    // produces a blob. See `services/curated-icons.json`.
+    // 0. Lottie animation — bundled or LottieFiles API. Checked FIRST
+    // because animated shapes (orbiting electrons, pulsing heart) are
+    // categorically better than any static icon or curated override.
+    try {
+      const lottieMatch = await lottieService.findAnimation(iconic);
+      if (lottieMatch) {
+        return {
+          name: lottieMatch.name,
+          concept,
+          dynamic: lottieMatch.url,
+          source: lottieMatch.source,
+          type: 'lottie',
+          score: 1.0,
+        };
+      }
+    } catch (err) {
+      console.warn('[shape-service] lottie lookup failed:', err.message);
+    }
+
+    // 0.5. Hand-curated override — wins over the matcher and generator
+    // for concepts where they pick the wrong icon or produce a blob.
     const curated = resolveCurated(iconic, concept);
     if (curated) return curated;
 
-    // 1. Iconify web search — 200k+ icons across 150+ open-licensed sets.
-    // Runs BEFORE the local embedding matcher (user preference): the much
-    // larger catalog tends to produce more specific matches than our 5,497-
-    // icon local library. Cache-miss path takes ~200-500ms (two HTTP calls);
-    // cache-hit path is disk-only (~1ms). License-filtered to commercial-safe
-    // OSS sets; palette-filtered to single-color silhouettes. On any failure
-    // (timeout, no match, sanitize reject) returns null and we fall through
-    // to the local matcher, preserving every existing behavior.
+    // 0.7. Library exact-match — if the iconic phrase kebab-matches a library
+    // icon name directly (e.g. "lightbulb" → lightbulb.svg, "volcano" →
+    // volcano.svg), use it before the fuzzy emoji/iconify tiers have a
+    // chance to return a wrong match (plug for lightbulb, person for volcano).
+    if (await iconMatcher.hasExactMatch(iconic)) {
+      const exactMatch = await iconMatcher.findBestMatch(iconic, { threshold: 0 });
+      if (exactMatch && exactMatch.score >= 1.0) {
+        const subdir = exactMatch.source === 'generated' ? svgGenerator.GENERATED_SUBDIR : 'library';
+        return {
+          name: exactMatch.name,
+          concept,
+          dynamic: `/shapes/${subdir}/${exactMatch.name}.svg`,
+          source: 'library-exact',
+          score: 1.0,
+        };
+      }
+    }
+
+    // 1. OpenMoji line-art emoji — ~2,400 hand-drawn SVG silhouettes, local.
+    // Runs FIRST among non-curated tiers because these glyphs were drawn by
+    // professional illustrators and combine with the stroke-following
+    // rasterizer (public/js/shapes.js → particlesFromGeomElements) to give
+    // the "brush on canvas" aesthetic that filled-silhouette icons can't.
+    //
+    // Gated by a noun-overlap check inside findBestMatch so high-cosine but
+    // wrong-concept matches (e.g. "wild hair" → "wildfire") are rejected.
+    // On miss the pipeline falls through to the much larger Iconify catalog
+    // for UI-type concepts ("laptop", "arrow up") where geometric precision
+    // beats hand-drawn character.
+    try {
+      const emoji = await emojiService.findBestMatch(iconic);
+      if (emoji) {
+        return {
+          name: `emoji-${emoji.hexcode}`,
+          concept,
+          dynamic: emoji.url,
+          source: 'emoji',
+          score: emoji.score,
+        };
+      }
+    } catch (err) {
+      console.warn('[shape-service] emoji lookup failed:', err.message);
+    }
+
+    // 2. Iconify web search — 200k+ icons across 150+ open-licensed sets.
+    // Reached when the emoji tier misses. Cache-miss path takes ~200-500ms
+    // (two HTTP calls); cache-hit path is disk-only (~1ms). License-filtered
+    // to commercial-safe OSS sets; palette-filtered to single-color
+    // silhouettes. On any failure (timeout, no match, sanitize reject)
+    // returns null and we fall through to the local matcher.
     const iconify = await iconifyService.findAndCache(iconic);
     if (iconify) {
       return {
@@ -136,7 +198,7 @@ async function resolveVisual(visual) {
       };
     }
 
-    // 2. Library / cached-generated match
+    // 3. Library / cached-generated match
     const match = await iconMatcher.findBestMatch(iconic, { threshold: EMBEDDING_THRESHOLD });
     if (match) {
       // Determine which directory the SVG lives in. Generated icons live in

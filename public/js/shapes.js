@@ -314,24 +314,24 @@ export function rasterizeShape(shapeName, resolution = 300, maxPoints = 30000) {
  * Morphological dilation: each output pixel is set if ANY input pixel within
  * a radius-r disk is set. Out-of-bounds is treated as unset.
  */
-function dilateMask(mask, n, r) {
+function dilateMask(mask, W, H, r) {
   const out = new Uint8Array(mask.length);
   const r2 = r * r;
-  for (let y = 0; y < n; y++) {
-    for (let x = 0; x < n; x++) {
-      if (mask[y * n + x]) { out[y * n + x] = 1; continue; }
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (mask[y * W + x]) { out[y * W + x] = 1; continue; }
       let hit = 0;
       for (let dy = -r; dy <= r && !hit; dy++) {
         const ny = y + dy;
-        if (ny < 0 || ny >= n) continue;
+        if (ny < 0 || ny >= H) continue;
         for (let dx = -r; dx <= r; dx++) {
           if (dx * dx + dy * dy > r2) continue;
           const nx = x + dx;
-          if (nx < 0 || nx >= n) continue;
-          if (mask[ny * n + nx]) { hit = 1; break; }
+          if (nx < 0 || nx >= W) continue;
+          if (mask[ny * W + nx]) { hit = 1; break; }
         }
       }
-      if (hit) out[y * n + x] = 1;
+      if (hit) out[y * W + x] = 1;
     }
   }
   return out;
@@ -343,24 +343,24 @@ function dilateMask(mask, n, r) {
  * shape isn't eroded at the canvas boundary (important for icons that span
  * the full bitmap — e.g. the basketball disc touches all four edges).
  */
-function erodeMask(mask, n, r) {
+function erodeMask(mask, W, H, r) {
   const out = new Uint8Array(mask.length);
   const r2 = r * r;
-  for (let y = 0; y < n; y++) {
-    for (let x = 0; x < n; x++) {
-      if (!mask[y * n + x]) continue;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (!mask[y * W + x]) continue;
       let stays = true;
       for (let dy = -r; dy <= r && stays; dy++) {
         const ny = y + dy;
-        if (ny < 0 || ny >= n) continue;
+        if (ny < 0 || ny >= H) continue;
         for (let dx = -r; dx <= r; dx++) {
           if (dx * dx + dy * dy > r2) continue;
           const nx = x + dx;
-          if (nx < 0 || nx >= n) continue;
-          if (!mask[ny * n + nx]) { stays = false; break; }
+          if (nx < 0 || nx >= W) continue;
+          if (!mask[ny * W + nx]) { stays = false; break; }
         }
       }
-      if (stays) out[y * n + x] = 1;
+      if (stays) out[y * W + x] = 1;
     }
   }
   return out;
@@ -374,7 +374,7 @@ function erodeMask(mask, n, r) {
  * two hemispheres), we boost the morphological closing radius to
  * bridge them into one silhouette.
  */
-function countLargeComponents(mask, n, minSize = 500) {
+function countLargeComponents(mask, W, H, minSize = 500) {
   const visited = new Uint8Array(mask.length);
   const stack = [];
   let count = 0;
@@ -388,12 +388,12 @@ function countLargeComponents(mask, n, minSize = 500) {
       if (visited[idx] || !mask[idx]) continue;
       visited[idx] = 1;
       size++;
-      const x = idx % n;
-      const y = (idx - x) / n;
+      const x = idx % W;
+      const y = (idx - x) / W;
       if (x > 0) stack.push(idx - 1);
-      if (x < n - 1) stack.push(idx + 1);
-      if (y > 0) stack.push(idx - n);
-      if (y < n - 1) stack.push(idx + n);
+      if (x < W - 1) stack.push(idx + 1);
+      if (y > 0) stack.push(idx - W);
+      if (y < H - 1) stack.push(idx + W);
     }
     if (size >= minSize) count++;
   }
@@ -433,9 +433,19 @@ function countLargeComponents(mask, n, minSize = 500) {
  * Edge pixels are duplicated 3x so more particles cluster on outlines.
  */
 function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library', maxPoints = 30000) {
+  // Render into a canvas that extends past the declared viewBox on every side.
+  // Some generated SVGs (e.g. generated-v2/moo-text.svg) have path points
+  // outside their viewBox — a rigid viewBox-sized canvas clips that content
+  // and the shape renders with half a glyph missing. The pad captures overflow;
+  // actual-content normalization below makes the final coords honest.
+  const OVERFLOW_PAD = 1.0;
+  const padPx = Math.round(resolution * OVERFLOW_PAD);
+  const W = resolution + padPx * 2;
+  const H = resolution + padPx * 2;
+
   const canvas = document.createElement('canvas');
-  canvas.width = resolution;
-  canvas.height = resolution;
+  canvas.width = W;
+  canvas.height = H;
   const ctx = canvas.getContext('2d');
 
   const [vx, vy, vw, vh] = viewBox.split(' ').map(Number);
@@ -443,6 +453,7 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   const scaleY = resolution / vh;
 
   ctx.fillStyle = 'white';
+  ctx.translate(padPx, padPx);
   ctx.scale(scaleX, scaleY);
   ctx.translate(-vx, -vy);
 
@@ -453,18 +464,18 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
 
   // Extract filled pixel positions at 1px resolution
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  const imageData = ctx.getImageData(0, 0, resolution, resolution);
+  const imageData = ctx.getImageData(0, 0, W, H);
   const data = imageData.data;
   const points = [];
 
   // First pass: build raw mask + compute bounding box
-  const raw = new Uint8Array(resolution * resolution);
-  let minX = resolution, maxX = -1, minY = resolution, maxY = -1;
-  for (let y = 0; y < resolution; y++) {
-    for (let x = 0; x < resolution; x++) {
-      const i = (y * resolution + x) * 4;
+  const raw = new Uint8Array(W * H);
+  let minX = W, maxX = -1, minY = H, maxY = -1;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
       if (data[i + 3] > 128) {
-        raw[y * resolution + x] = 1;
+        raw[y * W + x] = 1;
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -487,29 +498,41 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   let filled = raw;
   if (shapeSource === 'library' && maxX >= minX && maxY >= minY) {
     const bbDim = Math.max(1, Math.min(maxX - minX, maxY - minY));
-    const components = countLargeComponents(raw, resolution);
+    const components = countLargeComponents(raw, W, H);
     const fraction = components >= 2 ? 0.05 : 0.025;
     const R = Math.max(0, Math.round(bbDim * fraction));
     if (R >= 2) {
-      filled = erodeMask(dilateMask(raw, resolution, R), resolution, R);
+      filled = erodeMask(dilateMask(raw, W, H, R), W, H, R);
     }
   }
 
-  // Second pass: collect points with edge weighting
-  for (let y = 0; y < resolution; y++) {
-    for (let x = 0; x < resolution; x++) {
-      if (!filled[y * resolution + x]) continue;
+  // Normalize against the actual filled bbox, but use the SAME denominator for
+  // both axes so aspect ratio is preserved in the point cloud. Downstream
+  // _buildShape recomputes bbox from points and applies a single uniform scale,
+  // so the shorter axis naturally ends up with a smaller [0, <1] range. This
+  // matches the pre-fix behavior for in-viewBox shapes (where normalization
+  // was `/resolution`) while correctly handling shapes that overflow their
+  // declared viewBox.
+  if (maxX < minX || maxY < minY) return points;  // empty shape
+  const bboxW = maxX - minX + 1;
+  const bboxH = maxY - minY + 1;
+  const denom = Math.max(bboxW, bboxH);
 
-      const nx = x / resolution;
-      const ny = y / resolution;
+  // Second pass: collect points with edge weighting
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      if (!filled[y * W + x]) continue;
+
+      const nx = (x - minX) / denom;
+      const ny = (y - minY) / denom;
 
       // Check if this is an edge pixel (adjacent to unfilled)
       const isEdge =
-        x === 0 || x === resolution - 1 || y === 0 || y === resolution - 1 ||
-        !filled[(y - 1) * resolution + x] ||
-        !filled[(y + 1) * resolution + x] ||
-        !filled[y * resolution + (x - 1)] ||
-        !filled[y * resolution + (x + 1)];
+        x === 0 || x === W - 1 || y === 0 || y === H - 1 ||
+        !filled[(y - 1) * W + x] ||
+        !filled[(y + 1) * W + x] ||
+        !filled[y * W + (x - 1)] ||
+        !filled[y * W + (x + 1)];
 
       if (isEdge) {
         // Edge pixels get 3x representation for sharper outlines
@@ -552,7 +575,192 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
     points.length = K;
   }
 
+  points.aspectRatio = bboxW / bboxH;
   return points;
+}
+
+/**
+ * Stroke-following rasterizer: SVG geometry → particle point cloud sampled
+ * ALONG the paths (instead of inside their fills).
+ *
+ * Designed for line-art silhouettes (OpenMoji black, Iconify line sets,
+ * stroke-only icons) where `rasterizeFromPaths` would produce nothing
+ * because the paths have `fill="none"`. Uses the browser's native
+ * SVGGeometryElement.getTotalLength / getPointAtLength — no dependencies.
+ *
+ * Visual feel: particles behave like bristles on a brush following the
+ * stroke. Perpendicular jitter gives the stroke "weight"; along-tangent
+ * jitter breaks up the regularity of fixed-interval sampling.
+ *
+ * Same output contract as rasterizeFromPaths: points are {x, y} in
+ * [0, 1] × [0, <=1] (aspect-preserving, longest axis = 1), with
+ * `points.aspectRatio = bboxW / bboxH` attached.
+ *
+ * @param {SVGElement[]} geomEls — DOM nodes that implement SVGGeometryElement
+ *   (path, line, polyline, polygon, circle, ellipse, rect). Any other tags
+ *   are ignored.
+ * @param {string} viewBox — SVG viewBox string "minX minY width height".
+ * @param {number} resolution — target canvas-space size (longest axis).
+ * @param {number} maxPoints — hard cap on returned particles.
+ */
+export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, maxPoints = 30000) {
+  const [vx, vy, vw, vh] = viewBox.split(' ').map(Number);
+  // Uniform scale so the longest viewBox axis fills `resolution` — preserves
+  // aspect ratio. Offsets center the content inside the square measurement box.
+  const scale = resolution / Math.max(vw, vh);
+  const offsetX = (resolution - vw * scale) / 2;
+  const offsetY = (resolution - vh * scale) / 2;
+
+  // Brush knobs. Tuned for 300px resolution & ~10K particle budget.
+  const SAMPLE_STEP_PX = 1.3;    // canvas-px between samples along the stroke
+  const BRISTLE_COUNT = 3;       // particles per sample
+  const BRISTLE_SPREAD_PX = 1.8; // max perpendicular jitter, canvas-px
+  const ALONG_JITTER_PX = 0.5;   // max along-tangent jitter, canvas-px
+  const CORNER_BONUS = 2;        // multiplier for bristles at sharp turns
+
+  // Hidden SVG to host clones — getTotalLength/getPointAtLength require the
+  // element to be in the DOM and laid out.
+  const ns = 'http://www.w3.org/2000/svg';
+  const host = document.createElementNS(ns, 'svg');
+  host.setAttribute('viewBox', viewBox);
+  host.style.cssText = 'position:absolute;left:-9999px;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none';
+  document.body.appendChild(host);
+
+  const points = [];
+  const sampleStepSvg = SAMPLE_STEP_PX / scale;       // svg-units between samples
+  const bristleSpreadSvg = BRISTLE_SPREAD_PX / scale;
+  const alongJitterSvg = ALONG_JITTER_PX / scale;
+
+  try {
+    for (const el of geomEls) {
+      // Only sample elements that implement SVGGeometryElement.
+      if (typeof el.getTotalLength !== 'function') continue;
+
+      // Clone without children — we only need the element's geometry.
+      const clone = el.cloneNode(false);
+      host.appendChild(clone);
+
+      let totalLen = 0;
+      try {
+        totalLen = clone.getTotalLength();
+      } catch (_) { /* some browsers throw on degenerate geometry */ }
+      if (!Number.isFinite(totalLen) || totalLen <= 0) { host.removeChild(clone); continue; }
+
+      const numSamples = Math.max(2, Math.ceil(totalLen / sampleStepSvg));
+      let prevNtx = 0, prevNty = 0;
+
+      for (let i = 0; i < numSamples; i++) {
+        const t = (i / (numSamples - 1)) * totalLen;
+        const p = clone.getPointAtLength(t);
+
+        // Tangent via symmetric finite difference, clamped at ends.
+        const dt = Math.max(0.05, Math.min(sampleStepSvg * 0.5, totalLen * 0.5));
+        const tA = Math.max(0, t - dt);
+        const tB = Math.min(totalLen, t + dt);
+        const pA = clone.getPointAtLength(tA);
+        const pB = clone.getPointAtLength(tB);
+        const tx = pB.x - pA.x, ty = pB.y - pA.y;
+        const tLen = Math.hypot(tx, ty) || 1;
+        const ntx = tx / tLen, nty = ty / tLen;
+        const perpx = -nty, perpy = ntx;
+
+        // Corner detection: sharp tangent change → emit more bristles so
+        // joins stay crisp instead of getting thinned out.
+        let bristles = BRISTLE_COUNT;
+        if (i > 0) {
+          const dot = ntx * prevNtx + nty * prevNty;
+          if (dot < 0.7) bristles *= CORNER_BONUS;  // > ~45° turn
+        }
+        prevNtx = ntx; prevNty = nty;
+
+        for (let b = 0; b < bristles; b++) {
+          const perpOffset = (Math.random() - 0.5) * 2 * bristleSpreadSvg;
+          const alongOffset = (Math.random() - 0.5) * 2 * alongJitterSvg;
+          const rx = p.x + perpx * perpOffset + ntx * alongOffset;
+          const ry = p.y + perpy * perpOffset + nty * alongOffset;
+          // Map viewBox-units → measurement canvas pixel-units, store as unit square
+          const cx = offsetX + (rx - vx) * scale;
+          const cy = offsetY + (ry - vy) * scale;
+          points.push({ x: cx / resolution, y: cy / resolution });
+        }
+      }
+      host.removeChild(clone);
+    }
+  } finally {
+    document.body.removeChild(host);
+  }
+
+  if (points.length === 0) return points;
+
+  // Re-normalize to the actual point bbox with a shared denominator
+  // (aspect-preserving), matching rasterizeFromPaths's output contract.
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  const bboxW = maxX - minX;
+  const bboxH = maxY - minY;
+  const denom = Math.max(bboxW, bboxH) || 1;
+  for (const p of points) {
+    p.x = (p.x - minX) / denom;
+    p.y = (p.y - minY) / denom;
+  }
+
+  // Fair downsample to the particle budget. Same partial-shuffle trick as
+  // rasterizeFromPaths — walk-a-prefix consumers get a uniform sample.
+  if (points.length > maxPoints) {
+    const K = maxPoints, n = points.length;
+    for (let i = 0; i < K; i++) {
+      const j = i + Math.floor(Math.random() * (n - i));
+      if (j !== i) { const tmp = points[i]; points[i] = points[j]; points[j] = tmp; }
+    }
+    points.length = K;
+  }
+
+  points.aspectRatio = bboxW / (bboxH || 1);
+  return points;
+}
+
+/**
+ * Decide whether an SVG should be rendered stroke-following (line art) or
+ * fill-rasterized (silhouette). A line-art SVG is characterized by every
+ * geometry element declaring or inheriting `fill="none"` together with a
+ * non-none `stroke`. OpenMoji black/line set fits this pattern; Iconify
+ * fill sets do not.
+ *
+ * Returns true if a clear majority of geometry elements are stroke-only.
+ */
+function isStrokeOnlySvg(doc) {
+  const geomEls = doc.querySelectorAll('path, line, polyline, polygon, circle, ellipse, rect');
+  if (geomEls.length === 0) return false;
+
+  const resolveAttr = (el, name) => {
+    // Walk up ancestors to find the nearest declared attribute (SVG
+    // inheritance). Stops at the <svg> element.
+    let node = el;
+    while (node && node.nodeType === 1) {
+      const v = node.getAttribute && node.getAttribute(name);
+      if (v != null && v !== '') return v;
+      node = node.parentNode;
+      if (node && node.tagName && node.tagName.toLowerCase() === 'svg') {
+        const v2 = node.getAttribute && node.getAttribute(name);
+        return v2 != null && v2 !== '' ? v2 : null;
+      }
+    }
+    return null;
+  };
+
+  let strokeOnly = 0;
+  for (const el of geomEls) {
+    const fill = resolveAttr(el, 'fill');
+    const stroke = resolveAttr(el, 'stroke');
+    const isFillNone = fill === 'none';
+    const hasStroke = stroke && stroke !== 'none';
+    if (isFillNone && hasStroke) strokeOnly++;
+  }
+  // Threshold at 80% — generous to catch mixed sets like "filled fill + stroked outline".
+  return strokeOnly / geomEls.length >= 0.8;
 }
 
 /**
@@ -601,6 +809,21 @@ export async function loadExternalShape(url, resolution = 300, maxPoints = 30000
     const transformedGroups = doc.querySelectorAll('g[transform]');
     if (transformedGroups.length > 0) {
       console.warn(`[shapes] SVG has ${transformedGroups.length} <g transform> — paths may render incorrectly: ${url}`);
+    }
+
+    // Auto-dispatch between stroke-following and fill-rasterization based on
+    // what the SVG actually contains. Line-art SVGs (OpenMoji black, Iconify
+    // line sets) produce NOTHING under rasterizeFromPaths because every path
+    // has fill="none"; they need particlesFromGeomElements. Fill-based SVGs
+    // (FA solid, Material filled, LLM-generated) keep the existing path.
+    if (isStrokeOnlySvg(doc)) {
+      const geomEls = Array.from(doc.querySelectorAll('path, line, polyline, polygon, circle, ellipse, rect'));
+      if (geomEls.length === 0) return null;
+      // Inject a clone of the source SVG into the DOM so getPointAtLength
+      // can measure real on-page geometry (SVGGeometryElement methods require
+      // an in-document, laid-out element). particlesFromGeomElements handles
+      // its own hidden host — we just need to pass it live elements.
+      return particlesFromGeomElements(geomEls, viewBox, resolution, maxPoints);
     }
 
     const pathEls = doc.querySelectorAll('path');

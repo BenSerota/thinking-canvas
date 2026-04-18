@@ -13,15 +13,24 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const anthropic = new Anthropic();
 
-const EXTRACTION_PROMPT = `You identify iconic visual imagery for topics. Given a topic and context, return 1-3 concrete objects that people would immediately picture when thinking about this topic.
+const EXTRACTION_PROMPT = `You identify iconic visual imagery for topics. Given a topic and context, return 1-3 concrete PHYSICAL OBJECTS that people would immediately picture when thinking about this topic.
 
 Think associatively and iconically — what would appear in a simple illustration?
 - "Abraham Lincoln" → top hat, log cabin, book
 - "ocean travel" → boat, sun, fish
 - "programming" → computer, cup, book
 - "wedding" → heart, flower, person
-- "quantum physics" → atom, electron, wave
-- "phrenology" → skull, brain, measurement
+- "quantum physics" → atom, microscope, chalkboard
+- "phrenology" → skull, brain, caliper
+- "Albert Einstein" → atom, lightbulb, violin
+- "volcanoes" → volcano, lava, mountain
+
+CRITICAL RULES:
+- Every iconic MUST be a concrete physical object with a recognizable silhouette.
+- NEVER return text, equations, formulas, or written words (e.g., "equation e=mc2", "moo text", "resignation speech"). These cannot be drawn as icons.
+- NEVER return abstract visual descriptions (e.g., "glowing red stream", "color changing skin", "labeled regions"). These have no recognizable shape.
+- NEVER return actions or states (e.g., "person trembling", "two people embracing"). Return the object, not the scene.
+- Prefer common single objects: "lightbulb" not "light bulb moment", "violin" not "violin playing".
 
 When the topic is a famous landmark, monument, or proper-noun structure with a distinctive silhouette, INCLUDE the proper noun itself as one of the iconics (it routes to a hand-curated icon). Examples:
 - "Leaning Tower of Pisa" → leaning tower of pisa, bell, marble
@@ -30,7 +39,7 @@ When the topic is a famous landmark, monument, or proper-noun structure with a d
 - "Statue of Liberty" → statue of liberty, torch, crown
 
 For each concept, provide:
-- "iconic": the specific visual object people would picture. Be creative and specific — 1-3 words, lowercase, no punctuation (e.g., "top hat", "log cabin", "stethoscope", "electron orbit", "lincoln memorial", "phrenology skull"). There is no constrained vocabulary for this field.
+- "iconic": the specific visual object people would picture. Be creative and specific — 1-3 words, lowercase, no punctuation (e.g., "top hat", "log cabin", "stethoscope", "atom", "violin", "lightbulb"). There is no constrained vocabulary for this field.
 - "shape": a safety-net fallback — the closest match from this list: car, truck, bicycle, airplane, boat, dog, cat, bird, fish, horse, house, building, tree, mountain, sun, cloud, flower, phone, computer, book, cup, guitar, key, person, money, heart, star, food
 
 Return JSON only. No explanation.
