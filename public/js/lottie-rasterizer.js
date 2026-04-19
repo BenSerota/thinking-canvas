@@ -37,10 +37,10 @@ function edgeWeightAndNormalize(pixels, edgeLookup, globalMinX, globalMinY, deno
       !edgeLookup.has((p.y + 1) * W + p.x) ||
       !edgeLookup.has(p.y * W + (p.x - 1)) ||
       !edgeLookup.has(p.y * W + (p.x + 1));
-    points.push({ x: nx, y: ny });
+    points.push({ x: nx, y: ny, edge: isEdge });
     if (isEdge) {
-      points.push({ x: nx, y: ny });
-      points.push({ x: nx, y: ny });
+      points.push({ x: nx, y: ny, edge: true });
+      points.push({ x: nx, y: ny, edge: true });
     }
   }
   return points;
@@ -202,8 +202,8 @@ export async function loadLottieShape(url, resolution = 300, maxPointsPerFrame =
 
     // Static points first (identical every frame), dynamic points after
     const combined = [];
-    for (const p of staticPoints) combined.push({ x: p.x, y: p.y });
-    for (const p of dynamicPoints) combined.push({ x: p.x, y: p.y });
+    for (const p of staticPoints) combined.push({ x: p.x, y: p.y, edge: p.edge ?? false });
+    for (const p of dynamicPoints) combined.push({ x: p.x, y: p.y, edge: p.edge ?? false });
     frames.push(combined);
   }
 

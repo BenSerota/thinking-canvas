@@ -553,18 +553,18 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
 
   if (edgeOnly) {
     for (const p of edgePoints) {
-      points.push(p);
-      points.push({ x: p.x, y: p.y });
-      points.push({ x: p.x, y: p.y });
+      points.push({ x: p.x, y: p.y, edge: true });
+      points.push({ x: p.x, y: p.y, edge: true });
+      points.push({ x: p.x, y: p.y, edge: true });
     }
   } else {
     for (const p of edgePoints) {
-      points.push(p);
-      points.push({ x: p.x, y: p.y });
-      points.push({ x: p.x, y: p.y });
+      points.push({ x: p.x, y: p.y, edge: true });
+      points.push({ x: p.x, y: p.y, edge: true });
+      points.push({ x: p.x, y: p.y, edge: true });
     }
     for (const p of interiorPoints) {
-      points.push(p);
+      points.push({ x: p.x, y: p.y, edge: false });
     }
   }
 
@@ -704,7 +704,7 @@ export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, ma
           // Map viewBox-units → measurement canvas pixel-units, store as unit square
           const cx = offsetX + (rx - vx) * scale;
           const cy = offsetY + (ry - vy) * scale;
-          points.push({ x: cx / resolution, y: cy / resolution });
+          points.push({ x: cx / resolution, y: cy / resolution, edge: true });
         }
       }
       host.removeChild(clone);
@@ -963,7 +963,12 @@ export function rasterizeText(text, opts = {}) {
   for (const key of filled) {
     const x = key % bitmapW;
     const y = (key - x) / bitmapW;
-    points.push({ x: x / bitmapW, y: y / bitmapH });
+    const isEdge =
+      !filled.has((y - 1) * bitmapW + x) ||
+      !filled.has((y + 1) * bitmapW + x) ||
+      !filled.has(y * bitmapW + (x - 1)) ||
+      !filled.has(y * bitmapW + (x + 1));
+    points.push({ x: x / bitmapW, y: y / bitmapH, edge: isEdge });
   }
 
   if (points.length === 0) return null;

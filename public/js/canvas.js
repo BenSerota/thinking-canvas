@@ -22,6 +22,8 @@
 
 const PARTICLE_COUNT = 12000;
 const SAND_COLORS = ['#D4A574', '#C4956A', '#E8C9A0', '#B8845A', '#DEB887', '#C9A882'];
+const EDGE_COLORS = ['#F0D8B0', '#EED5A8', '#F5E0BE', '#E8D0A0'];
+const INTERIOR_COLORS = ['#A07050', '#8C6545', '#977055', '#B08060'];
 const BG_COLOR = '#0d0d1a';
 const PARTICLE_SIZE = 2.0;
 const GLOW_SIZE = 5;
@@ -153,6 +155,7 @@ export class ThinkingCanvas {
   _initParticles() {
     this.particles = [];
     for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const c = SAND_COLORS[Math.floor(Math.random() * SAND_COLORS.length)];
       this.particles.push({
         x: Math.random() * (this.width || 800),
         y: Math.random() * (this.height || 600),
@@ -160,7 +163,8 @@ export class ThinkingCanvas {
         vy: (Math.random() - 0.5) * 0.5,
         targetX: null,
         targetY: null,
-        color: SAND_COLORS[Math.floor(Math.random() * SAND_COLORS.length)],
+        color: c,
+        baseColor: c,
         size: PARTICLE_SIZE + (Math.random() - 0.5) * 0.8,
         phase: Math.random() * Math.PI * 2,
         isShapeParticle: false,
@@ -188,6 +192,7 @@ export class ThinkingCanvas {
         p.targetX = null;
         p.targetY = null;
         p.isShapeParticle = false;
+        p.color = p.baseColor;
         p.hurricaneCenterX = null;
         p.hurricaneCenterY = null;
       }
@@ -214,6 +219,7 @@ export class ThinkingCanvas {
     const basePoints = textPoints.map(p => ({
       x: offsetX + p.x * titleWidth,
       y: offsetY + p.y * titleHeight,
+      edge: p.edge ?? false,
     }));
 
     let bpMinX = Infinity, bpMaxX = -Infinity;
@@ -252,6 +258,7 @@ export class ThinkingCanvas {
       this.particles[pi].targetX = null;
       this.particles[pi].targetY = null;
       this.particles[pi].isShapeParticle = false;
+      this.particles[pi].color = this.particles[pi].baseColor;
     }
     this.currentShapes = this.currentShapes.filter(s => s !== shape);
     this.thinkingTitle = null;
@@ -264,19 +271,18 @@ export class ThinkingCanvas {
   setTitle(textPoints, label = 'Thinking Canvas') {
     if (!textPoints || textPoints.length === 0) return;
 
-    // Lay the title out near the top of the canvas. Use the aspectRatio
-    // that rasterizeText attached, so letters don't squish.
     const aspectRatio = textPoints.aspectRatio || 4;
     const titleWidth = Math.min(this.width * 0.7, this.height * aspectRatio * 0.18);
     const titleHeight = titleWidth / aspectRatio;
     const centerX = this.width / 2;
-    const centerY = this.height * 0.18;  // top ~18% of canvas
+    const centerY = this.height * 0.18;
     const offsetX = centerX - titleWidth / 2;
     const offsetY = centerY - titleHeight / 2;
 
     const basePoints = textPoints.map(p => ({
       x: offsetX + p.x * titleWidth,
       y: offsetY + p.y * titleHeight,
+      edge: p.edge ?? false,
     }));
 
     let bpMinX = Infinity, bpMaxX = -Infinity;
@@ -350,6 +356,7 @@ export class ThinkingCanvas {
           p.targetX = null;
           p.targetY = null;
           p.isShapeParticle = false;
+          p.color = p.baseColor;
         }
       }
       setTimeout(doAssign, 200);
@@ -445,6 +452,7 @@ export class ThinkingCanvas {
     const basePoints = shapePoints.map(p => ({
       x: centerX + (p.x - inCenterX) * scale,
       y: centerY + (p.y - inCenterY) * scale,
+      edge: p.edge ?? false,
     }));
 
     return {
@@ -496,6 +504,7 @@ export class ThinkingCanvas {
       frame.map(p => ({
         x: centerX + (p.x - gcx) * scale,
         y: centerY + (p.y - gcy) * scale,
+        edge: p.edge ?? false,
       }))
     );
     shape.animationFps = Math.min(animOpts.fps || 5, 5);
@@ -510,7 +519,7 @@ export class ThinkingCanvas {
     // which differs when dynamic elements (electrons) extend the global bbox
     // in other frames. Without this, static particles sit at _buildShape
     // positions while dynamic particles jump to _attachAnimation positions.
-    shape.basePoints = shape.animationFrames[0].map(p => ({ x: p.x, y: p.y }));
+    shape.basePoints = shape.animationFrames[0].map(p => ({ x: p.x, y: p.y, edge: p.edge ?? false }));
   }
 
   /**
@@ -575,6 +584,7 @@ export class ThinkingCanvas {
       p.targetX = null;
       p.targetY = null;
       p.isShapeParticle = false;
+      p.color = p.baseColor;
       p.hurricaneCenterX = cx;
       p.hurricaneCenterY = cy;
     }
@@ -635,6 +645,7 @@ export class ThinkingCanvas {
       p.targetX = null;
       p.targetY = null;
       p.isShapeParticle = false;
+      p.color = p.baseColor;
       p.hurricaneCenterX = null;
       p.hurricaneCenterY = null;
       p.vx += (Math.random() - 0.5) * 2;
@@ -848,6 +859,8 @@ export class ThinkingCanvas {
             const bp = shape.basePoints[k % shape.basePoints.length];
             this.particles[pi].targetX = bp.x + (Math.random() - 0.5) * 2;
             this.particles[pi].targetY = bp.y + (Math.random() - 0.5) * 2;
+            const palette = bp.edge ? EDGE_COLORS : INTERIOR_COLORS;
+            this.particles[pi].color = palette[Math.floor(Math.random() * palette.length)];
           }
         }
         continue;
@@ -888,6 +901,7 @@ export class ThinkingCanvas {
             for (let i = sc; i < shape.basePoints.length && i < newFrame.length; i++) {
               shape.basePoints[i].x = newFrame[i].x + ox;
               shape.basePoints[i].y = newFrame[i].y + oy;
+              shape.basePoints[i].edge = newFrame[i].edge ?? false;
             }
           }
         }
@@ -918,6 +932,8 @@ export class ThinkingCanvas {
         if (this.particles[pi].targetX == null) {
           this.particles[pi].targetX = bp.x + (Math.random() - 0.5) * 3;
           this.particles[pi].targetY = bp.y + (Math.random() - 0.5) * 3;
+          const palette = bp.edge ? EDGE_COLORS : INTERIOR_COLORS;
+          this.particles[pi].color = palette[Math.floor(Math.random() * palette.length)];
         } else {
           this.particles[pi].targetX = bp.x;
           this.particles[pi].targetY = bp.y;
