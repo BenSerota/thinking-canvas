@@ -518,7 +518,10 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   const bboxH = maxY - minY + 1;
   const denom = Math.max(bboxW, bboxH);
 
-  // Second pass: collect points with edge weighting
+  // Second pass: collect edge and interior points separately so we can
+  // detect "too simple" filled icons (solid blocks with no internal detail).
+  const edgePoints = [];
+  const interiorPoints = [];
   for (let y = minY; y <= maxY; y++) {
     for (let x = minX; x <= maxX; x++) {
       if (!filled[y * W + x]) continue;
@@ -526,7 +529,6 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
       const nx = (x - minX) / denom;
       const ny = (y - minY) / denom;
 
-      // Check if this is an edge pixel (adjacent to unfilled)
       const isEdge =
         x === 0 || x === W - 1 || y === 0 || y === H - 1 ||
         !filled[(y - 1) * W + x] ||
@@ -535,13 +537,34 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
         !filled[y * W + (x + 1)];
 
       if (isEdge) {
-        // Edge pixels get 3x representation for sharper outlines
-        points.push({ x: nx, y: ny });
-        points.push({ x: nx, y: ny });
-        points.push({ x: nx, y: ny });
+        edgePoints.push({ x: nx, y: ny });
       } else {
-        points.push({ x: nx, y: ny });
+        interiorPoints.push({ x: nx, y: ny });
       }
+    }
+  }
+
+  // Detect "too simple" filled shapes: if edges are < 12% of total pixels,
+  // the shape is a solid blob with little internal structure. Drop interior
+  // points entirely and render edge-only so the silhouette outline is visible.
+  const totalPixels = edgePoints.length + interiorPoints.length;
+  const edgeRatio = totalPixels > 0 ? edgePoints.length / totalPixels : 1;
+  const edgeOnly = edgeRatio < 0.12;
+
+  if (edgeOnly) {
+    for (const p of edgePoints) {
+      points.push(p);
+      points.push({ x: p.x, y: p.y });
+      points.push({ x: p.x, y: p.y });
+    }
+  } else {
+    for (const p of edgePoints) {
+      points.push(p);
+      points.push({ x: p.x, y: p.y });
+      points.push({ x: p.x, y: p.y });
+    }
+    for (const p of interiorPoints) {
+      points.push(p);
     }
   }
 
@@ -905,14 +928,42 @@ export function rasterizeText(text, opts = {}) {
   // Scan pixels, collect filled positions, and normalize to [0,1] × [0,1].
   const imageData = ctx.getImageData(0, 0, bitmapW, bitmapH);
   const data = imageData.data;
-  const points = [];
+
+  // Build a set of filled pixel coordinates for erosion.
+  let filled = new Set();
   for (let y = 0; y < bitmapH; y++) {
     for (let x = 0; x < bitmapW; x++) {
       const i = (y * bitmapW + x) * 4;
       if (data[i + 3] > alphaThreshold) {
-        points.push({ x: x / bitmapW, y: y / bitmapH });
+        filled.add(y * bitmapW + x);
       }
     }
+  }
+
+  // Morphological erosion: peel boundary pixels to thin strokes uniformly.
+  const erode = opts.erode || 0;
+  for (let pass = 0; pass < erode; pass++) {
+    const interior = new Set();
+    for (const key of filled) {
+      const x = key % bitmapW;
+      const y = (key - x) / bitmapW;
+      if (
+        filled.has((y - 1) * bitmapW + x) &&
+        filled.has((y + 1) * bitmapW + x) &&
+        filled.has(y * bitmapW + (x - 1)) &&
+        filled.has(y * bitmapW + (x + 1))
+      ) {
+        interior.add(key);
+      }
+    }
+    filled = interior;
+  }
+
+  const points = [];
+  for (const key of filled) {
+    const x = key % bitmapW;
+    const y = (key - x) / bitmapW;
+    points.push({ x: x / bitmapW, y: y / bitmapH });
   }
 
   if (points.length === 0) return null;

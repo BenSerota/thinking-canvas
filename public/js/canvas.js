@@ -192,7 +192,69 @@ export class ThinkingCanvas {
         p.hurricaneCenterY = null;
       }
       this.currentShapes = [];
+      this.thinkingTitle = null;
     }
+  }
+
+  /**
+   * Show "I'm thinking about..." as particle text above the hurricane.
+   * Displayed during thinking/carousel, cleared on Ferris wheel transition.
+   */
+  setThinkingTitle(textPoints) {
+    if (!textPoints || textPoints.length === 0) return;
+
+    const aspectRatio = textPoints.aspectRatio || 6;
+    const titleWidth = Math.min(this.width * 0.65, this.height * aspectRatio * 0.12);
+    const titleHeight = titleWidth / aspectRatio;
+    const centerX = this.width / 2;
+    const centerY = this.height * 0.12;
+    const offsetX = centerX - titleWidth / 2;
+    const offsetY = centerY - titleHeight / 2;
+
+    const basePoints = textPoints.map(p => ({
+      x: offsetX + p.x * titleWidth,
+      y: offsetY + p.y * titleHeight,
+    }));
+
+    let bpMinX = Infinity, bpMaxX = -Infinity;
+    for (const bp of basePoints) {
+      if (bp.x < bpMinX) bpMinX = bp.x;
+      if (bp.x > bpMaxX) bpMaxX = bp.x;
+    }
+
+    const shape = {
+      label: '',
+      centerX,
+      centerY,
+      isTitle: true,
+      bboxMax: titleWidth,
+      orbitRadius: 0,
+      orbitPhase: 0,
+      basePoints,
+      particleIndices: [],
+      writeReveal: {
+        time: 0,
+        duration: 2.0,
+        minX: bpMinX,
+        maxX: bpMaxX,
+      },
+    };
+
+    this._assignShapeToParticles([shape]);
+    this.currentShapes = [shape];
+    this.thinkingTitle = shape;
+  }
+
+  clearThinkingTitle() {
+    if (!this.thinkingTitle) return;
+    const shape = this.thinkingTitle;
+    for (const pi of shape.particleIndices) {
+      this.particles[pi].targetX = null;
+      this.particles[pi].targetY = null;
+      this.particles[pi].isShapeParticle = false;
+    }
+    this.currentShapes = this.currentShapes.filter(s => s !== shape);
+    this.thinkingTitle = null;
   }
 
   /**
@@ -212,19 +274,33 @@ export class ThinkingCanvas {
     const offsetX = centerX - titleWidth / 2;
     const offsetY = centerY - titleHeight / 2;
 
+    const basePoints = textPoints.map(p => ({
+      x: offsetX + p.x * titleWidth,
+      y: offsetY + p.y * titleHeight,
+    }));
+
+    let bpMinX = Infinity, bpMaxX = -Infinity;
+    for (const bp of basePoints) {
+      if (bp.x < bpMinX) bpMinX = bp.x;
+      if (bp.x > bpMaxX) bpMaxX = bp.x;
+    }
+
     const shape = {
       label,
       centerX,
       centerY,
       isTitle: true,
       bboxMax: titleWidth,
-      orbitRadius: 0,     // title doesn't orbit
+      orbitRadius: 0,
       orbitPhase: 0,
-      basePoints: textPoints.map(p => ({
-        x: offsetX + p.x * titleWidth,
-        y: offsetY + p.y * titleHeight,
-      })),
+      basePoints,
       particleIndices: [],
+      writeReveal: {
+        time: 0,
+        duration: 2.5,
+        minX: bpMinX,
+        maxX: bpMaxX,
+      },
     };
 
     this._assignShapeToParticles([shape]);
@@ -248,23 +324,29 @@ export class ThinkingCanvas {
       if (animationOpts) {
         this._attachAnimation(singleShape, animationOpts, this.width / 2, this.height / 2, 1.0);
       }
-      this._assignShapeToParticles([singleShape]);
-      this.currentShapes = [singleShape];
+      if (this.thinkingTitle) {
+        const reserved = new Set(this.thinkingTitle.particleIndices);
+        this._assignShapeToParticles([singleShape], reserved);
+        this.currentShapes = [this.thinkingTitle, singleShape];
+      } else {
+        this._assignShapeToParticles([singleShape]);
+        this.currentShapes = [singleShape];
+      }
       this.state = 'forming';
-      // Start at 1 so the label is visible immediately — no fade-in delay.
       this.transitionProgress = 1;
     };
 
     if (transition === 'crossfade' && this.state === 'forming') {
       this.state = 'transitioning';
-      for (const p of this.particles) {
-        if (p.targetX !== null) {
-          // Give shape particles an outward scatter kick…
+      // Collect thinking title particle indices so we don't scatter them.
+      const titlePIs = this.thinkingTitle
+        ? new Set(this.thinkingTitle.particleIndices)
+        : null;
+      for (let i = 0; i < this.particles.length; i++) {
+        const p = this.particles[i];
+        if (p.targetX !== null && (!titlePIs || !titlePIs.has(i))) {
           p.vx += (Math.random() - 0.5) * 4;
           p.vy += (Math.random() - 0.5) * 4;
-          // …then release them from the spring entirely so they actually
-          // drift. Without nulling targets here, spring physics (SPRING_K)
-          // immediately cancels the kick and the shape stays frozen.
           p.targetX = null;
           p.targetY = null;
           p.isShapeParticle = false;
@@ -283,6 +365,7 @@ export class ThinkingCanvas {
    * Used once all shapes for a turn have arrived (turn 2+).
    */
   setShapes(shapesPointsAndLabels) {
+    this.thinkingTitle = null;
     const n = shapesPointsAndLabels.length;
     if (n === 0) return this.clearShape();
     if (n === 1) return this.setShape(shapesPointsAndLabels[0].points, shapesPointsAndLabels[0].label);
@@ -439,28 +522,27 @@ export class ThinkingCanvas {
    * Runtime contract check: verify the output Y-range covers the input
    * Y-range. If not, a downstream slicing bug has regressed.
    */
-  _assignShapeToParticles(shapes) {
+  _assignShapeToParticles(shapes, reservedIndices = null) {
     const particleCount = this.particles.length;
 
-    // Total shape-particle budget.
     const budget = Math.min(
       shapes.reduce((sum, s) => sum + s.basePoints.length, 0),
       Math.floor(particleCount * SHAPE_PARTICLE_RATIO)
     );
 
-    // Allocate each shape a slice proportional to the particles it needs.
-    // Cap per shape at its basePoints.length (can't use more particles
-    // than it has target positions).
     const perShapeBudget = shapes.map(s => {
       const idealShare = Math.floor(budget / shapes.length);
       return Math.min(s.basePoints.length, idealShare);
     });
     const totalShapeSlots = perShapeBudget.reduce((a, b) => a + b, 0);
 
-    // Shuffle particle indices so shape assignment is spatially random
-    // (no clumps of "particles that happened to be in this corner all
-    // end up in shape 0").
-    const indices = [...Array(particleCount).keys()];
+    // Build pool of available indices, excluding any reserved by a
+    // persistent shape (e.g. the thinking title during carousel).
+    const indices = [];
+    for (let i = 0; i < particleCount; i++) {
+      if (reservedIndices && reservedIndices.has(i)) continue;
+      indices.push(i);
+    }
     for (let i = indices.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [indices[i], indices[j]] = [indices[j], indices[i]];
@@ -487,7 +569,7 @@ export class ThinkingCanvas {
     // per-shape mini-hurricanes.
     const cx = this.width / 2;
     const cy = this.height / 2;
-    for (; cursor < particleCount; cursor++) {
+    for (; cursor < indices.length; cursor++) {
       const pi = indices[cursor];
       const p = this.particles[pi];
       p.targetX = null;
@@ -758,8 +840,8 @@ export class ThinkingCanvas {
     const canvasCy = this.height / 2;
 
     for (const shape of this.currentShapes) {
-      if (shape.isTitle) {
-        // Title particles: targets set once, never change.
+      if (shape.isTitle && !shape.writeReveal) {
+        // Static title (page-load "Thinking Canvas"): targets set once.
         if (shape.particleIndices.length && this.particles[shape.particleIndices[0]].targetX == null) {
           for (let k = 0; k < shape.particleIndices.length; k++) {
             const pi = shape.particleIndices[k];
@@ -770,57 +852,69 @@ export class ThinkingCanvas {
         }
         continue;
       }
+      // Non-title shapes: orbit movement + animation frame cycling.
+      // Animated titles (writeReveal) skip this block but share the
+      // writeReveal + target-setting code below.
+      if (!shape.isTitle) {
+        let newCx = shape.centerX;
+        let newCy = shape.centerY;
 
-      let newCx = shape.centerX;
-      let newCy = shape.centerY;
-
-      if (inCarousel && shape.orbitRadius > 0) {
-        // Travel around the canvas center at (orbitRadius, carouselAngle + orbitPhase).
-        newCx = canvasCx + shape.orbitRadius * Math.cos(this.carouselAngle + shape.orbitPhase);
-        newCy = canvasCy + shape.orbitRadius * Math.sin(this.carouselAngle + shape.orbitPhase);
-      }
-
-      const dx = newCx - shape.centerX;
-      const dy = newCy - shape.centerY;
-      shape.centerX = newCx;
-      shape.centerY = newCy;
-
-      // Translate every basePoint by (dx, dy) so the shape moves with its
-      // center. Shapes stay upright — no spin around own centroid.
-      if (dx !== 0 || dy !== 0) {
-        for (const bp of shape.basePoints) {
-          bp.x += dx;
-          bp.y += dy;
+        if (inCarousel && shape.orbitRadius > 0) {
+          newCx = canvasCx + shape.orbitRadius * Math.cos(this.carouselAngle + shape.orbitPhase);
+          newCy = canvasCy + shape.orbitRadius * Math.sin(this.carouselAngle + shape.orbitPhase);
         }
-      }
 
-      // Animation frame cycling: swap basePoints to the next frame when
-      // enough time has elapsed.
-      if (shape.animationFrames && shape.animationFrames.length > 1) {
-        shape.animationTime += 1 / 60;
-        const newIdx = Math.floor(shape.animationTime * shape.animationFps) % shape.animationFrames.length;
-        if (newIdx !== shape.currentFrameIdx) {
-          shape.currentFrameIdx = newIdx;
-          const ox = shape.centerX - (shape.animationOriginX || shape.centerX);
-          const oy = shape.centerY - (shape.animationOriginY || shape.centerY);
-          const newFrame = shape.animationFrames[newIdx];
-          // Only retarget the dynamic portion (after staticPointCount).
-          // Static points (nucleus, orbit rings) are identical across frames
-          // so their particles stay locked in place.
-          const sc = shape.staticPointCount || 0;
-          for (let i = sc; i < shape.basePoints.length && i < newFrame.length; i++) {
-            shape.basePoints[i].x = newFrame[i].x + ox;
-            shape.basePoints[i].y = newFrame[i].y + oy;
+        const dx = newCx - shape.centerX;
+        const dy = newCy - shape.centerY;
+        shape.centerX = newCx;
+        shape.centerY = newCy;
+
+        if (dx !== 0 || dy !== 0) {
+          for (const bp of shape.basePoints) {
+            bp.x += dx;
+            bp.y += dy;
           }
         }
+
+        if (shape.animationFrames && shape.animationFrames.length > 1) {
+          shape.animationTime += 1 / 60;
+          const newIdx = Math.floor(shape.animationTime * shape.animationFps) % shape.animationFrames.length;
+          if (newIdx !== shape.currentFrameIdx) {
+            shape.currentFrameIdx = newIdx;
+            const ox = shape.centerX - (shape.animationOriginX || shape.centerX);
+            const oy = shape.centerY - (shape.animationOriginY || shape.centerY);
+            const newFrame = shape.animationFrames[newIdx];
+            const sc = shape.staticPointCount || 0;
+            for (let i = sc; i < shape.basePoints.length && i < newFrame.length; i++) {
+              shape.basePoints[i].x = newFrame[i].x + ox;
+              shape.basePoints[i].y = newFrame[i].y + oy;
+            }
+          }
+        }
+      }
+
+      // Handwriting reveal: sweep a threshold left-to-right so particles
+      // "write" the text. Unrevealed particles stay in the hurricane.
+      let revealX = Infinity;
+      if (shape.writeReveal) {
+        const wr = shape.writeReveal;
+        wr.time += 1 / 60;
+        const t = Math.min(wr.time / wr.duration, 1);
+        const ease = t * (2 - t);
+        revealX = wr.minX + (wr.maxX - wr.minX) * ease;
       }
 
       // Write targets: each particle tracks its assigned basePoint.
       for (let k = 0; k < shape.particleIndices.length; k++) {
         const pi = shape.particleIndices[k];
         const bp = shape.basePoints[k % shape.basePoints.length];
-        // On the very first frame, seed the jitter; subsequent frames
-        // just update position.
+
+        if (bp.x > revealX) {
+          this.particles[pi].targetX = null;
+          this.particles[pi].targetY = null;
+          continue;
+        }
+
         if (this.particles[pi].targetX == null) {
           this.particles[pi].targetX = bp.x + (Math.random() - 0.5) * 3;
           this.particles[pi].targetY = bp.y + (Math.random() - 0.5) * 3;

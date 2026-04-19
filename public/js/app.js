@@ -60,18 +60,10 @@ class App {
    */
   _showTitle() {
     const titleBudget = Math.floor(getShapeParticleBudget() * 0.25);
-    // Helvetica Neue Thin (weight 200) has more stroke area than UltraLight
-    // (100) — UltraLight at 72px is so thin that raising alphaThreshold
-    // above the AA fringe drops almost every pixel, and the title becomes
-    // unreadable particle-dust. Thin + threshold 160 keeps the stroke body
-    // while dropping the softest edge pixels — the result reads as a
-    // genuinely hair-thin face, not a padded one. Larger size (84px) gives
-    // a few extra pixels of stroke width so letterforms survive the
-    // threshold filter. Upright (no italic) for a cleaner, Swiss feel.
     const points = rasterizeText('Thinking Canvas', {
-      font: "200 84px 'Helvetica Neue', 'Avenir Next', -apple-system, sans-serif",
+      font: "400 140px 'Love Light', cursive",
       maxPoints: titleBudget,
-      alphaThreshold: 160,
+      alphaThreshold: 128,
     });
     if (points) {
       this.canvas.setTitle(points, 'Thinking Canvas');
@@ -87,6 +79,9 @@ class App {
     this.canvas.setState('gathering');
     this._clearConceptCycle();
     this.turnShapes = [];  // fresh for this turn
+
+    // Show "I'm thinking about..." immediately as the hurricane forms.
+    this._showThinkingTitle();
 
     try {
       const response = await fetch('/api/chat/stream', {
@@ -379,6 +374,18 @@ class App {
 
     const label = info.concept || info.name;
     this.canvas.setShape(points, label, transition, animated || null);
+  }
+
+  _showThinkingTitle() {
+    const budget = Math.floor(getShapeParticleBudget() * 0.15);
+    const points = rasterizeText('I\'m thinking about...', {
+      font: "400 100px 'Love Light', cursive",
+      maxPoints: budget,
+      alphaThreshold: 128,
+    });
+    if (points) {
+      this.canvas.setThinkingTitle(points);
+    }
   }
 
   _clearConceptCycle() {
