@@ -56,15 +56,7 @@ function loadManifest() {
   }
 }
 
-function toKebab(text) {
-  return String(text || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[_\s]+/g, '-')
-    .replace(/[^a-z0-9-]/g, '')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
+const { toKebab } = require('./utils');
 
 function matchBundled(iconic) {
   loadManifest();

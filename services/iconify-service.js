@@ -64,16 +64,7 @@ if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
-/** Convert free-form text to kebab-case — same rule as icon-matcher.toKebab. */
-function toKebab(text) {
-  return String(text || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[_\s]+/g, '-')
-    .replace(/[^a-z0-9-]/g, '')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
+const { toKebab } = require('./utils');
 
 /** Fetch with a hard timeout. Returns { ok, status, text } or throws on timeout/network. */
 async function fetchWithTimeout(url, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
@@ -105,6 +96,9 @@ function sanitizeSvg(svg) {
   if (/<script\b/i.test(svg)) return null;
   if (/<foreignObject\b/i.test(svg)) return null;
   if (/<image\b/i.test(svg)) return null;
+  if (/<style\b/i.test(svg)) return null;
+  if (/<animate\b/i.test(svg)) return null;
+  if (/\bon\w+\s*=/i.test(svg)) return null;
   if (/xlink:href\s*=\s*["']https?:/i.test(svg)) return null;
   if (/href\s*=\s*["']https?:/i.test(svg)) return null;
 

@@ -2,15 +2,13 @@
  * SVG Generator Service
  *
  * On-demand SVG generation for concepts that didn't match any library icon.
- * Calls Sonnet, validates the result strictly, and caches successful
- * generations to public/shapes/generated-v2/{kebab}.svg.
+ * Calls Opus (Sonnet fallback), validates strictly, and caches to
+ * public/shapes/generated-v3/{kebab}.svg.
  *
- * Prompt v2 (2026-04-15) — the v1 prompt produced featureless blobs
- * (colosseum → rounded rectangle, "leaning tower of pisa" → plain rectangle
- * with no lean). v2 forces Claude to enumerate iconic features BEFORE drawing,
- * permits fill-rule="evenodd" for holes (arches, eye sockets, donut gaps), and
- * shows 3 few-shot examples. The on-disk cache was moved to `generated-v2/` to
- * bust every v1 result — nothing references the old directory now.
+ * Prompt v3 (2026-04-17) — upgraded to Opus 4.7 for much better silhouette
+ * quality. v2 forced Claude to enumerate iconic features before drawing and
+ * added fill-rule="evenodd" for holes; v3 keeps those rules and improves
+ * model quality. Cache dir bumped to `generated-v3/` on each prompt revision.
  *
  * Strict validation rules (aligned with our Path2D.fill() rasterization pipeline):
  *   - Parses as valid XML
@@ -37,7 +35,7 @@
 const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
-const { DOMParser } = require('xmldom');
+const { DOMParser } = require('@xmldom/xmldom');
 const { svgPathProperties } = require('svg-path-properties');
 
 const iconMatcher = require('./icon-matcher');
@@ -107,16 +105,7 @@ Before drawing, silently identify the 3 most iconic visual features of this conc
 
 Output the <svg>...</svg> only.`;
 
-/** Normalize an iconic string to a safe filename kebab. */
-function toKebab(text) {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[_\s]+/g, '-')
-    .replace(/[^a-z0-9-]/g, '')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
+const { toKebab } = require('./utils');
 
 /**
  * Strip markdown fences, XML prologs, and extract the <svg> element if Claude
@@ -148,6 +137,12 @@ function validate(svgText, { iconic = '' } = {}) {
   // Rule: no transforms anywhere
   if (/\btransform\s*=/i.test(svgText)) {
     return { ok: false, reason: 'transform attribute present' };
+  }
+  if (/<(?:script|style|foreignObject|image|animate|animateTransform)\b/i.test(svgText)) {
+    return { ok: false, reason: 'dangerous element present' };
+  }
+  if (/\bon\w+\s*=/i.test(svgText)) {
+    return { ok: false, reason: 'event handler attribute present' };
   }
   // Rule: no strokes (rasterizer fills only; strokes would render invisible)
   if (/\bstroke\s*=\s*["'](?!none\b)[^"']+["']/i.test(svgText)) {
@@ -265,7 +260,7 @@ function validate(svgText, { iconic = '' } = {}) {
 
 /**
  * Generate an SVG for the given iconic concept. Returns:
- *   { ok: true, name: "kebab-name", url: "/shapes/generated-v2/…svg", detail }
+ *   { ok: true, name: "kebab-name", url: "/shapes/generated-v3/…svg", detail }
  *   { ok: false, reason: "…" }
  *   null  (if rate-limited or otherwise skipped)
  *

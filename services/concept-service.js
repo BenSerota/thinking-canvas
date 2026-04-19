@@ -52,71 +52,7 @@ function extractConceptsFromText(text, max = 3) {
   return matches.slice(0, max);
 }
 
-/**
- * Parse a JSON concept prefix from the start of an LLM response.
- *
- * Expected format: {"concepts":["dog","park","sun"]}\n<response text>
- *
- * Returns { concepts: string[], remainingText: string } if found,
- * or null if the prefix hasn't arrived yet or isn't present.
- */
-function parseConceptPrefix(textSoFar) {
-  // Look for a JSON object at the very start
-  const trimmed = textSoFar.trimStart();
-
-  if (!trimmed.startsWith('{')) {
-    // No JSON prefix — the LLM is responding directly
-    return { concepts: null, remainingText: textSoFar };
-  }
-
-  // Try to find the closing brace
-  const closingIdx = trimmed.indexOf('}');
-  if (closingIdx === -1) {
-    // JSON hasn't fully arrived yet — keep buffering
-    return null;
-  }
-
-  const jsonStr = trimmed.slice(0, closingIdx + 1);
-  try {
-    const parsed = JSON.parse(jsonStr);
-    if (parsed.concepts && Array.isArray(parsed.concepts)) {
-      // Strip the JSON line (and any trailing newline) from the text
-      let remaining = trimmed.slice(closingIdx + 1);
-      if (remaining.startsWith('\n')) remaining = remaining.slice(1);
-      return {
-        concepts: parsed.concepts.slice(0, 3),
-        remainingText: remaining,
-      };
-    }
-  } catch (e) {
-    // Malformed JSON — treat as no prefix
-  }
-
-  return { concepts: null, remainingText: textSoFar };
-}
-
-/**
- * Extract concepts from an extended thinking block.
- * Uses the same keyword regex but tuned for longer, more abstract text.
- */
-function extractConceptsFromThinking(thinkingText) {
-  return extractConceptsFromText(thinkingText, 2);
-}
-
-/**
- * Scan accumulated response text for NEW concepts not already found.
- * Returns only newly discovered concepts.
- */
-function scanForNewConcepts(accumulatedText, alreadyFound = []) {
-  const allConcepts = extractConceptsFromText(accumulatedText, 5);
-  const newConcepts = allConcepts.filter(c => !alreadyFound.includes(c));
-  return newConcepts.slice(0, 2);
-}
-
 module.exports = {
   CONCEPT_KEYWORDS,
   extractConceptsFromText,
-  parseConceptPrefix,
-  extractConceptsFromThinking,
-  scanForNewConcepts,
 };

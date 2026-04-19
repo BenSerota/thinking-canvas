@@ -23,11 +23,16 @@ const emojiService = require('./services/emoji-service');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error('ERROR: ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key.');
+  process.exit(1);
+}
+
 // Warm up matchers at boot so first request doesn't pay the init cost
 iconMatcher.init().catch(err => console.warn('[server] iconMatcher init failed:', err.message));
 emojiService.init().catch(err => console.warn('[server] emojiService init failed:', err.message));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 /**
@@ -42,8 +47,14 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.post('/api/chat/stream', async (req, res) => {
   const { message, history } = req.body;
 
-  if (!message) {
+  if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'No message provided' });
+  }
+  if (message.length > 10000) {
+    return res.status(400).json({ error: 'Message too long' });
+  }
+  if (history && (!Array.isArray(history) || history.length > 50)) {
+    return res.status(400).json({ error: 'Invalid history' });
   }
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -110,7 +121,7 @@ app.post('/api/chat/stream', async (req, res) => {
     if (res.writableEnded) return;
     console.error('Stream error:', err.name, err.message);
     if (!res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ type: 'text', text: `API error: ${err.message}` })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'text', text: 'Sorry, something went wrong. Please try again.' })}\n\n`);
     }
   }
 
@@ -126,8 +137,14 @@ app.post('/api/chat/stream', async (req, res) => {
 app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body;
 
-  if (!message) {
+  if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'No message provided' });
+  }
+  if (message.length > 10000) {
+    return res.status(400).json({ error: 'Message too long' });
+  }
+  if (history && (!Array.isArray(history) || history.length > 50)) {
+    return res.status(400).json({ error: 'Invalid history' });
   }
 
   try {
@@ -152,7 +169,7 @@ app.post('/api/chat', async (req, res) => {
   } catch (err) {
     console.error('Chat error:', err.message);
     res.status(500).json({
-      text: 'Error: Could not get response from Claude API. Check your ANTHROPIC_API_KEY.',
+      text: 'Sorry, something went wrong. Please try again.',
       concepts: [{ name: 'question', dynamic: null }],
     });
   }

@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const embeddingService = require('./embedding-service');
+const { toKebab } = require('./utils');
 
 const ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(ROOT, 'public', 'shapes', 'library-manifest.json');
@@ -39,16 +40,6 @@ const state = {
   nameToIdx: new Map(), // "top-hat" → index
 };
 
-/** Convert free-form text to kebab-case for exact-match lookup. */
-function toKebab(text) {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[_\s]+/g, '-')
-    .replace(/[^a-z0-9-]/g, '')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
 
 /**
  * Initialize the matcher — loads manifest + embeddings into memory.

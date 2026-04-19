@@ -186,7 +186,6 @@ export async function loadLottieShape(url, resolution = 300, maxPointsPerFrame =
   staticPoints = fisherYatesDownsample(staticPoints, staticBudget, 12345);
   const staticCount = staticPoints.length;
 
-  console.log(`[lottie-rasterizer] static: ${staticRawPixels.length}px → ${staticCount}pts, dynamic: ${dynamicRawCount}px → ${dynamicBudget}pts budget`);
 
   // Pass 4: process dynamic pixels per frame, prepend static
   const frames = [];
@@ -211,6 +210,5 @@ export async function loadLottieShape(url, resolution = 300, maxPointsPerFrame =
   const nonEmpty = frames.filter(f => f.length > 0);
   if (nonEmpty.length === 0) return null;
 
-  console.log(`[lottie-rasterizer] done: ${nonEmpty.length} frames, ~${nonEmpty[0].length} pts/frame (${staticCount} static + ${nonEmpty[0].length - staticCount} dynamic), fps=${fps}`);
   return { frames: nonEmpty, fps, duration, staticCount };
 }

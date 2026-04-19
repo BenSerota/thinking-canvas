@@ -797,9 +797,6 @@ export class ThinkingCanvas {
       // Animation frame cycling: swap basePoints to the next frame when
       // enough time has elapsed.
       if (shape.animationFrames && shape.animationFrames.length > 1) {
-        if (shape.animationTime === 0) {
-          console.log(`[canvas] animation active: ${shape.animationFrames.length} frames, ${shape.animationFps}fps, static=${shape.staticPointCount}, label="${shape.label}"`);
-        }
         shape.animationTime += 1 / 60;
         const newIdx = Math.floor(shape.animationTime * shape.animationFps) % shape.animationFrames.length;
         if (newIdx !== shape.currentFrameIdx) {
