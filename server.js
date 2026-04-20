@@ -22,16 +22,12 @@ const iconMatcher = require('./services/icon-matcher');
 const emojiService = require('./services/emoji-service');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error('ERROR: ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key.');
   process.exit(1);
 }
-
-// Warm up matchers at boot so first request doesn't pay the init cost
-iconMatcher.init().catch(err => console.warn('[server] iconMatcher init failed:', err.message));
-emojiService.init().catch(err => console.warn('[server] emojiService init failed:', err.message));
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
@@ -180,4 +176,18 @@ app.post('/api/chat', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`\n  Thinking Canvas is running!\n`);
   console.log(`  Open http://localhost:${PORT} in your browser\n`);
+
+  setImmediate(async () => {
+    try {
+      await iconMatcher.init();
+    } catch (err) {
+      console.warn('[server] iconMatcher init failed:', err.message);
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    try {
+      await emojiService.init();
+    } catch (err) {
+      console.warn('[server] emojiService init failed:', err.message);
+    }
+  });
 });

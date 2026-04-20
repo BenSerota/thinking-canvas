@@ -34,6 +34,8 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const CATALOG_PATH = path.join(ROOT, 'data', 'emoji-catalog.json');
 const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'emoji-embeddings.json');
+const INDEX_PATH = path.join(ROOT, 'data', 'emoji-embeddings.index.json');
+const VECTORS_PATH = path.join(ROOT, 'data', 'emoji-embeddings.f32');
 const SVG_DIR_URL = '/shapes/emoji';
 
 // Threshold chosen to mirror icon-matcher.js (0.55). We can tune after
@@ -104,20 +106,47 @@ async function init() {
   if (state.initPromise) return state.initPromise;
 
   state.initPromise = (async () => {
-    if (!fs.existsSync(CATALOG_PATH) || !fs.existsSync(EMBEDDINGS_PATH)) {
-      console.warn('[emoji-service] catalog or embeddings missing — emoji tier disabled. Run `node scripts/fetch-emoji.js && node scripts/build-emoji-embeddings.js`.');
+    if (!fs.existsSync(CATALOG_PATH)) {
+      console.warn('[emoji-service] catalog missing — emoji tier disabled.');
       state.ready = true;
       return;
     }
 
-    const catalog = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf-8'));
-    const embData = JSON.parse(fs.readFileSync(EMBEDDINGS_PATH, 'utf-8'));
-
-    // Index the catalog by hexcode so we can project embeddings back to
-    // display metadata without relying on insertion order.
+    const catalog = JSON.parse(await fs.promises.readFile(CATALOG_PATH, 'utf-8'));
     const byHex = new Map();
     for (const e of catalog.emoji) byHex.set(e.hexcode, e);
 
+    if (fs.existsSync(INDEX_PATH) && fs.existsSync(VECTORS_PATH)) {
+      const index = JSON.parse(await fs.promises.readFile(INDEX_PATH, 'utf-8'));
+      const buf = await fs.promises.readFile(VECTORS_PATH);
+      const expectedBytes = index.count * index.dim * 4;
+
+      if (buf.length === expectedBytes) {
+        const allVectors = new Float32Array(buf.buffer, buf.byteOffset, index.count * index.dim);
+        for (let i = 0; i < index.count; i++) {
+          const hexcode = index.hexcodes[i];
+          const meta = byHex.get(hexcode);
+          if (!meta) continue;
+          state.hexcodes.push(hexcode);
+          state.emojis.push(meta.emoji);
+          state.annotations.push(meta.annotation);
+          state.tags.push(meta.tags || '');
+          state.vectors.push(allVectors.subarray(i * index.dim, (i + 1) * index.dim));
+        }
+        state.ready = true;
+        console.log(`[emoji-service] ready (binary) — ${state.hexcodes.length} emoji indexed (OpenMoji ${catalog.releaseTag})`);
+        return;
+      }
+      console.warn('[emoji-service] binary file size mismatch, falling back to JSON');
+    }
+
+    if (!fs.existsSync(EMBEDDINGS_PATH)) {
+      console.warn('[emoji-service] embeddings missing — emoji tier disabled.');
+      state.ready = true;
+      return;
+    }
+
+    const embData = JSON.parse(await fs.promises.readFile(EMBEDDINGS_PATH, 'utf-8'));
     for (const entry of embData.entries) {
       const meta = byHex.get(entry.hexcode);
       if (!meta) continue;
@@ -128,9 +157,9 @@ async function init() {
       state.vectors.push(new Float32Array(entry.embedding));
     }
     state.ready = true;
-    console.log(`[emoji-service] ready — ${state.hexcodes.length} emoji indexed (OpenMoji ${catalog.releaseTag})`);
+    console.log(`[emoji-service] ready (json) — ${state.hexcodes.length} emoji indexed (OpenMoji ${catalog.releaseTag})`);
   })().catch(err => {
-    state.initPromise = null;  // allow retry on transient I/O error
+    state.initPromise = null;
     throw err;
   });
 

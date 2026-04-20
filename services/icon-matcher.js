@@ -21,6 +21,8 @@ const { toKebab } = require('./utils');
 const ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(ROOT, 'public', 'shapes', 'library-manifest.json');
 const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'library-embeddings.json');
+const INDEX_PATH = path.join(ROOT, 'data', 'library-embeddings.index.json');
+const VECTORS_PATH = path.join(ROOT, 'data', 'library-embeddings.f32');
 // Generated-SVG cache directory — versioned so prompt changes bypass the old
 // cache without manual cleanup. Kept in sync with svg-generator.js
 // GENERATED_SUBDIR constant; changing the version there requires bumping
@@ -45,6 +47,18 @@ const state = {
  * Initialize the matcher — loads manifest + embeddings into memory.
  * Safe to call multiple times; actual work runs once.
  */
+async function scanGeneratedDir() {
+  if (fs.existsSync(GENERATED_DIR)) {
+    for (const f of await fs.promises.readdir(GENERATED_DIR)) {
+      if (!f.endsWith('.svg')) continue;
+      const name = f.replace(/\.svg$/, '');
+      if (!state.nameToIdx.has(name)) {
+        state.nameToIdx.set(name, -1);
+      }
+    }
+  }
+}
+
 async function init() {
   if (state.ready) return;
   if (state.initPromise) return state.initPromise;
@@ -55,48 +69,51 @@ async function init() {
       state.ready = true;
       return;
     }
+
+    const manifest = JSON.parse(await fs.promises.readFile(MANIFEST_PATH, 'utf-8'));
+    const sourceByName = new Map();
+    for (const ic of manifest.icons) sourceByName.set(ic.name, ic.source);
+
+    if (fs.existsSync(INDEX_PATH) && fs.existsSync(VECTORS_PATH)) {
+      const index = JSON.parse(await fs.promises.readFile(INDEX_PATH, 'utf-8'));
+      const buf = await fs.promises.readFile(VECTORS_PATH);
+      const expectedBytes = index.count * index.dim * 4;
+
+      if (buf.length === expectedBytes) {
+        const allVectors = new Float32Array(buf.buffer, buf.byteOffset, index.count * index.dim);
+        for (let i = 0; i < index.count; i++) {
+          const name = index.names[i];
+          state.names.push(name);
+          state.sources.push(sourceByName.get(name) || 'unknown');
+          state.vectors.push(allVectors.subarray(i * index.dim, (i + 1) * index.dim));
+          state.nameToIdx.set(name, state.names.length - 1);
+        }
+        await scanGeneratedDir();
+        state.ready = true;
+        const genCount = state.nameToIdx.size - state.names.length;
+        console.log(`[icon-matcher] ready (binary): ${state.names.length} embedded icons + ${genCount} generated`);
+        return;
+      }
+      console.warn('[icon-matcher] binary file size mismatch, falling back to JSON');
+    }
+
     if (!fs.existsSync(EMBEDDINGS_PATH)) {
       console.warn('[icon-matcher] no embeddings found — library matching disabled. Run `npm run build-embeddings`.');
       state.ready = true;
       return;
     }
 
-    const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf-8'));
-    const embData = JSON.parse(fs.readFileSync(EMBEDDINGS_PATH, 'utf-8'));
-
-    // Build source lookup from manifest
-    const sourceByName = new Map();
-    for (const ic of manifest.icons) sourceByName.set(ic.name, ic.source);
-
-    // Join embeddings to manifest
+    const embData = JSON.parse(await fs.promises.readFile(EMBEDDINGS_PATH, 'utf-8'));
     for (const entry of embData.entries) {
-      const name = entry.name;
-      const vec = new Float32Array(entry.embedding);
-      // Vectors are already L2-normalized by the embedding service, but double-check
-      state.names.push(name);
-      state.sources.push(sourceByName.get(name) || 'unknown');
-      state.vectors.push(vec);
-      state.nameToIdx.set(name, state.names.length - 1);
+      state.names.push(entry.name);
+      state.sources.push(sourceByName.get(entry.name) || 'unknown');
+      state.vectors.push(new Float32Array(entry.embedding));
+      state.nameToIdx.set(entry.name, state.names.length - 1);
     }
-
-    // Scan GENERATED_DIR (versioned, currently `public/shapes/generated-v2/`)
-    // for previously-cached generations and add them to the exact-match set.
-    // Their embeddings get computed lazily on first embedding-match call if needed.
-    // Old unversioned `generated/` directories from prior prompt versions are
-    // deliberately NOT scanned — bumping the version effectively wipes the cache.
-    if (fs.existsSync(GENERATED_DIR)) {
-      for (const f of fs.readdirSync(GENERATED_DIR)) {
-        if (!f.endsWith('.svg')) continue;
-        const name = f.replace(/\.svg$/, '');
-        if (!state.nameToIdx.has(name)) {
-          // Register as exact-match only; no embedding yet
-          state.nameToIdx.set(name, -1);
-        }
-      }
-    }
-
+    await scanGeneratedDir();
     state.ready = true;
-    console.log(`[icon-matcher] ready: ${state.names.length} embedded icons + ${state.nameToIdx.size - state.names.length} generated`);
+    const genCount = state.nameToIdx.size - state.names.length;
+    console.log(`[icon-matcher] ready (json): ${state.names.length} embedded icons + ${genCount} generated`);
   })();
 
   return state.initPromise;

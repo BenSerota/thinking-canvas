@@ -35,15 +35,22 @@ async function main() {
   const manifest = JSON.parse(manifestText);
   const manifestChecksum = sha256(manifestText);
 
-  // Skip if already built with same checksum
+  // Skip if already built with same checksum AND binary files exist
+  const BIN_INDEX = path.join(ROOT, 'data', 'library-embeddings.index.json');
+  const BIN_VECTORS = path.join(ROOT, 'data', 'library-embeddings.f32');
   if (fs.existsSync(OUT_PATH)) {
     try {
       const existing = JSON.parse(fs.readFileSync(OUT_PATH, 'utf-8'));
-      if (existing.manifestChecksum === manifestChecksum) {
+      if (existing.manifestChecksum === manifestChecksum
+          && fs.existsSync(BIN_INDEX) && fs.existsSync(BIN_VECTORS)) {
         console.log('[build-embeddings] up to date — nothing to do.');
         return;
       }
-      console.log('[build-embeddings] manifest changed — rebuilding...');
+      if (existing.manifestChecksum === manifestChecksum) {
+        console.log('[build-embeddings] binary files missing — regenerating...');
+      } else {
+        console.log('[build-embeddings] manifest changed — rebuilding...');
+      }
     } catch (_) {
       // malformed — fall through to rebuild
     }
@@ -92,6 +99,34 @@ async function main() {
   const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`[build-embeddings] done. ${entries.length} vectors × ${output.dim} dims = ${sizeMB} MB in ${totalSec}s`);
   console.log(`[build-embeddings] wrote ${path.relative(ROOT, OUT_PATH)}`);
+
+  // Binary format: tiny index JSON + raw Float32 blob (zero-parse at load time)
+  const INDEX_PATH = path.join(ROOT, 'data', 'library-embeddings.index.json');
+  const VECTORS_PATH = path.join(ROOT, 'data', 'library-embeddings.f32');
+  const EMBED_DIM = embeddingService.EMBED_DIM;
+
+  fs.writeFileSync(INDEX_PATH, JSON.stringify({
+    format: 'binary-f32',
+    version: 1,
+    model: embeddingService.MODEL_NAME,
+    dim: EMBED_DIM,
+    count: entries.length,
+    manifestChecksum,
+    generatedAt: output.generatedAt,
+    names: entries.map(e => e.name),
+  }));
+
+  const vectorBuf = Buffer.alloc(entries.length * EMBED_DIM * 4);
+  for (let i = 0; i < entries.length; i++) {
+    const offset = i * EMBED_DIM * 4;
+    for (let j = 0; j < EMBED_DIM; j++) {
+      vectorBuf.writeFloatLE(entries[i].embedding[j], offset + j * 4);
+    }
+  }
+  fs.writeFileSync(VECTORS_PATH, vectorBuf);
+
+  const binMB = (vectorBuf.length / 1024 / 1024).toFixed(1);
+  console.log(`[build-embeddings] binary: ${path.relative(ROOT, VECTORS_PATH)} (${binMB} MB)`);
 }
 
 main().catch(err => {

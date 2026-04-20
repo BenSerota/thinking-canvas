@@ -682,6 +682,17 @@ export class ThinkingCanvas {
         if (this._lowFpsCount >= 3) {
           const reduction = Math.floor(this.particles.length * 0.15);
           this.particles.splice(this.particles.length - reduction, reduction);
+          // Drop any particleIndices that now point past the end — otherwise
+          // _applyShapeRotation reads this.particles[pi] and crashes on undefined.
+          const newLen = this.particles.length;
+          for (const shape of this.currentShapes) {
+            if (shape.particleIndices) {
+              shape.particleIndices = shape.particleIndices.filter(pi => pi < newLen);
+            }
+          }
+          if (this.thinkingTitle && this.thinkingTitle.particleIndices) {
+            this.thinkingTitle.particleIndices = this.thinkingTitle.particleIndices.filter(pi => pi < newLen);
+          }
           this._lowFpsCount = 0;
         }
       } else {

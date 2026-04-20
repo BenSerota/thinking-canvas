@@ -23,6 +23,10 @@ import { loadLottieShape } from './lottie-rasterizer.js';
 // shapes cycle in ~6s before the group view.
 const CYCLE_MS = 2000;
 
+function nextFrame() {
+  return new Promise(resolve => requestAnimationFrame(resolve));
+}
+
 class App {
   constructor() {
     this.canvas = new ThinkingCanvas(document.getElementById('thinkingCanvas'));
@@ -122,16 +126,13 @@ class App {
               break;
 
             case 'concept_resolved':
-              // Per-shape streaming: render the FIRST arrival immediately so
-              // the canvas starts forming while shapes 2-3 are still resolving
-              // on the server.
-              if (data.shape) await this._onConceptResolved(data.shape);
+              if (data.shape) {
+                await this._onConceptResolved(data.shape);
+                await nextFrame();
+              }
               break;
 
             case 'concepts_done':
-              // Terminal marker — all shapes have arrived. If we collected
-              // 2+ shapes, switch from single-shape crossfade to side-by-side
-              // multi-shape view.
               await this._onConceptsDone();
               break;
 
@@ -398,6 +399,9 @@ class App {
   }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+try {
   window.app = new App();
-});
+  console.log('[app] App created successfully');
+} catch (err) {
+  console.error('[app] App constructor CRASHED:', err.message, err.stack);
+}

@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "description": "AI conversation interface with particle-based thinking visualization",
   "main": "server.js",
+  "author": "Ben Serota",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BenSerota/thinking-canvas.git"
+  },
   "scripts": {
     "start": "node server.js",
     "fetch-icons": "node scripts/fetch-icons.js",

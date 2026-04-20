@@ -54,14 +54,21 @@ async function main() {
   const catalog = JSON.parse(catalogText);
   const catalogChecksum = sha256(catalogText);
 
+  const BIN_INDEX = path.join(ROOT, 'data', 'emoji-embeddings.index.json');
+  const BIN_VECTORS = path.join(ROOT, 'data', 'emoji-embeddings.f32');
   if (fs.existsSync(OUT_PATH)) {
     try {
       const existing = JSON.parse(fs.readFileSync(OUT_PATH, 'utf-8'));
-      if (existing.catalogChecksum === catalogChecksum) {
+      if (existing.catalogChecksum === catalogChecksum
+          && fs.existsSync(BIN_INDEX) && fs.existsSync(BIN_VECTORS)) {
         console.log('[build-emoji-embeddings] up to date — nothing to do.');
         return;
       }
-      console.log('[build-emoji-embeddings] catalog changed — rebuilding...');
+      if (existing.catalogChecksum === catalogChecksum) {
+        console.log('[build-emoji-embeddings] binary files missing — regenerating...');
+      } else {
+        console.log('[build-emoji-embeddings] catalog changed — rebuilding...');
+      }
     } catch (_) { /* fall through to rebuild */ }
   }
 
@@ -86,17 +93,48 @@ async function main() {
     }
   }
 
+  const builtAt = new Date().toISOString();
+
   fs.writeFileSync(OUT_PATH, JSON.stringify({
     releaseTag: catalog.releaseTag,
     model: embeddingService.MODEL_NAME,
     dim: embeddingService.EMBED_DIM,
     catalogChecksum,
-    builtAt: new Date().toISOString(),
+    builtAt,
     entries: out,
   }));
 
   const secs = Math.round((Date.now() - start) / 1000);
   console.log(`[build-emoji-embeddings] done — ${out.length} embeddings written to ${OUT_PATH} in ${secs}s`);
+
+  // Binary format: tiny index JSON + raw Float32 blob (zero-parse at load time)
+  const INDEX_PATH = path.join(ROOT, 'data', 'emoji-embeddings.index.json');
+  const VECTORS_PATH = path.join(ROOT, 'data', 'emoji-embeddings.f32');
+  const EMBED_DIM = embeddingService.EMBED_DIM;
+
+  fs.writeFileSync(INDEX_PATH, JSON.stringify({
+    format: 'binary-f32',
+    version: 1,
+    model: embeddingService.MODEL_NAME,
+    dim: EMBED_DIM,
+    count: out.length,
+    catalogChecksum,
+    builtAt,
+    releaseTag: catalog.releaseTag,
+    hexcodes: out.map(e => e.hexcode),
+  }));
+
+  const vectorBuf = Buffer.alloc(out.length * EMBED_DIM * 4);
+  for (let i = 0; i < out.length; i++) {
+    const offset = i * EMBED_DIM * 4;
+    for (let j = 0; j < EMBED_DIM; j++) {
+      vectorBuf.writeFloatLE(out[i].embedding[j], offset + j * 4);
+    }
+  }
+  fs.writeFileSync(VECTORS_PATH, vectorBuf);
+
+  const binMB = (vectorBuf.length / 1024 / 1024).toFixed(1);
+  console.log(`[build-emoji-embeddings] binary: ${path.relative(ROOT, VECTORS_PATH)} (${binMB} MB)`);
 }
 
 main().catch(err => {

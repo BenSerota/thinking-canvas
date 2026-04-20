@@ -551,6 +551,10 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   const edgeRatio = totalPixels > 0 ? edgePoints.length / totalPixels : 1;
   const edgeOnly = edgeRatio < 0.12;
 
+  if (edgeOnly && resolution <= 300) {
+    return rasterizeFromPaths(paths, viewBox, resolution * 2, shapeSource, maxPoints);
+  }
+
   const pixelSize = 1 / denom;
   if (edgeOnly) {
     for (const p of edgePoints) {
@@ -569,25 +573,17 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
     }
   }
 
-  // Cap at `maxPoints` for performance AND to make the output safe for any
-  // downstream consumer that walks a prefix (e.g. `points[i % len]` in
-  // canvas.js _assignShape). The rasterizer emits points in scanline order
-  // (top-to-bottom, left-to-right), so a naive truncation would keep only
-  // the top of the shape. A partial Fisher-Yates that collects samples at
-  // the END of the array then truncates at the START is also wrong — it
-  // keeps the un-sampled items. We do a proper partial shuffle that moves
-  // samples to the FRONT:
-  //   for i in [0, K): swap points[i] with a random index j in [i, N)
-  //   then truncate to length K.
-  // This yields a uniform K-sample of the N points. Upstream sampling at
-  // the correct K (the consumer's particle budget) is how we PREVENT the
-  // slicing-bug regression from reappearing when PARTICLE_COUNT or
-  // SHAPE_PARTICLE_RATIO change. Historical: this bug bit us twice
-  // (f2a317d, f561856) when different consumers made the prefix-is-uniform
-  // assumption on their own. Do the sample once, here, correctly, always.
-  if (points.length > maxPoints) {
+  // Shuffle unconditionally so ANY prefix of the array is a uniform spatial
+  // sample. This is critical for the ferris wheel: each shape gets only
+  // budget/N particles, and _applyShapeRotation walks basePoints[0..slots].
+  // Without shuffling, those slots cover only the first scanlines (top of
+  // the shape) and the bottom half vanishes.
+  //
+  // When points.length > maxPoints, the shuffle doubles as a partial
+  // Fisher-Yates that selects a uniform K-sample and truncates.
+  {
     const n = points.length;
-    const K = maxPoints;
+    const K = Math.min(n, maxPoints);
     for (let i = 0; i < K; i++) {
       const j = i + Math.floor(Math.random() * (n - i));
       if (j !== i) {
@@ -731,10 +727,10 @@ export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, ma
     p.y = (p.y - minY) / denom;
   }
 
-  // Fair downsample to the particle budget. Same partial-shuffle trick as
-  // rasterizeFromPaths — walk-a-prefix consumers get a uniform sample.
-  if (points.length > maxPoints) {
-    const K = maxPoints, n = points.length;
+  // Shuffle unconditionally so any prefix is a uniform spatial sample
+  // (same rationale as rasterizeFromPaths — ferris wheel uses a prefix).
+  {
+    const K = Math.min(points.length, maxPoints), n = points.length;
     for (let i = 0; i < K; i++) {
       const j = i + Math.floor(Math.random() * (n - i));
       if (j !== i) { const tmp = points[i]; points[i] = points[j]; points[j] = tmp; }
@@ -974,13 +970,10 @@ export function rasterizeText(text, opts = {}) {
 
   if (points.length === 0) return null;
 
-  // Uniform-sample down to maxPoints using the same pattern as
-  // rasterizeFromPaths. Title glyphs produce a lot of edge pixels; the
-  // scanline-ordered prefix would slice the baseline off, which would be
-  // visually catastrophic.
-  if (points.length > maxPoints) {
+  // Shuffle unconditionally (same rationale as rasterizeFromPaths).
+  {
     const n = points.length;
-    const K = maxPoints;
+    const K = Math.min(n, maxPoints);
     for (let i = 0; i < K; i++) {
       const j = i + Math.floor(Math.random() * (n - i));
       if (j !== i) {

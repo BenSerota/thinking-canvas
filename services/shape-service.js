@@ -228,7 +228,29 @@ async function resolveVisual(visual) {
     }
   }
 
-  // 3. Built-in fallback
+  // 3.5. Substring fallback: drop leading words to find the core noun
+  // "chicago bulls jersey" → try "bulls jersey" → try "jersey"
+  if (iconic) {
+    const words = iconic.split(/\s+/);
+    for (let i = 1; i < words.length; i++) {
+      const suffix = words.slice(i).join(' ');
+      const iconify = await iconifyService.findAndCache(suffix);
+      if (iconify) {
+        return { name: iconify.name, concept, dynamic: iconify.url, source: 'iconify', score: 1.0 };
+      }
+      const match = await iconMatcher.findBestMatch(suffix, { threshold: EMBEDDING_THRESHOLD });
+      if (match) {
+        const subdir = match.source === 'generated' ? svgGenerator.GENERATED_SUBDIR : 'library';
+        return {
+          name: match.name, concept,
+          dynamic: `/shapes/${subdir}/${match.name}.svg`,
+          source: match.source, score: match.score,
+        };
+      }
+    }
+  }
+
+  // 4. Built-in fallback
   return { name: builtinFallback, concept, dynamic: null, source: 'builtin' };
 }
 
