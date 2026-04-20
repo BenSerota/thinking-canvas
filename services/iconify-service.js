@@ -97,7 +97,7 @@ function sanitizeSvg(svg) {
   if (/<foreignObject\b/i.test(svg)) return null;
   if (/<image\b/i.test(svg)) return null;
   if (/<style\b/i.test(svg)) return null;
-  if (/<animate\b/i.test(svg)) return null;
+  if (/<animate/i.test(svg)) return null;
   if (/\bon\w+\s*=/i.test(svg)) return null;
   if (/xlink:href\s*=\s*["']https?:/i.test(svg)) return null;
   if (/href\s*=\s*["']https?:/i.test(svg)) return null;

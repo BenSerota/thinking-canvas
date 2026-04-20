@@ -13,7 +13,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const anthropic = new Anthropic();
 
-const EXTRACTION_PROMPT = `You identify iconic visual imagery for topics. Given a topic and context, return 1-3 concrete PHYSICAL OBJECTS that people would immediately picture when thinking about this topic.
+const EXTRACTION_PROMPT = `You identify iconic visual imagery for topics. Given a topic and context, return exactly 3 concrete PHYSICAL OBJECTS that people would immediately picture when thinking about this topic.
 
 Think associatively and iconically — what would appear in a simple illustration?
 - "Abraham Lincoln" → top hat, log cabin, book

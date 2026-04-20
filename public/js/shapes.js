@@ -551,11 +551,12 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   const edgeRatio = totalPixels > 0 ? edgePoints.length / totalPixels : 1;
   const edgeOnly = edgeRatio < 0.12;
 
+  const pixelSize = 1 / denom;
   if (edgeOnly) {
     for (const p of edgePoints) {
       points.push({ x: p.x, y: p.y, edge: true });
-      points.push({ x: p.x, y: p.y, edge: true });
-      points.push({ x: p.x, y: p.y, edge: true });
+      points.push({ x: p.x + (Math.random() - 0.5) * pixelSize, y: p.y + (Math.random() - 0.5) * pixelSize, edge: true });
+      points.push({ x: p.x + (Math.random() - 0.5) * pixelSize, y: p.y + (Math.random() - 0.5) * pixelSize, edge: true });
     }
   } else {
     for (const p of edgePoints) {

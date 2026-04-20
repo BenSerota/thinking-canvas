@@ -11,6 +11,7 @@ if (fs.existsSync(envPath)) {
 }
 
 const express = require('express');
+const helmet = require('helmet');
 const path = require('path');
 
 // Services
@@ -32,6 +33,7 @@ if (!process.env.ANTHROPIC_API_KEY) {
 iconMatcher.init().catch(err => console.warn('[server] iconMatcher init failed:', err.message));
 emojiService.init().catch(err => console.warn('[server] emojiService init failed:', err.message));
 
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
