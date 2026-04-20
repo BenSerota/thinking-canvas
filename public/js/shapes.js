@@ -1050,9 +1050,11 @@ export function conceptToShape(concept) {
 
   if (synonyms[c]) return synonyms[c];
 
-  // Partial match
+  // Partial match — word-boundary aware to avoid false positives
+  // (e.g. "glove" should NOT match "love")
   for (const [synonym, shape] of Object.entries(synonyms)) {
-    if (c.includes(synonym) || synonym.includes(c)) return shape;
+    const re = new RegExp(`\\b${synonym}\\b`);
+    if (re.test(c) || new RegExp(`\\b${c}\\b`).test(synonym)) return shape;
   }
 
   // Default to question mark for unknown concepts
