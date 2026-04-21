@@ -14,7 +14,7 @@
 
 import { ThinkingCanvas, getShapeParticleBudget } from './canvas.js';
 import { ChatPanel } from './chat.js';
-import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape, getAvailableShapes } from './shapes.js';
+import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape } from './shapes.js';
 import { loadLottieShape } from './lottie-rasterizer.js';
 
 // How long each shape stays on screen during the crossfade cycle (ms).
@@ -39,7 +39,6 @@ class App {
     this.conceptIndex = 0;
     this.conceptTimer = null;
 
-    this._precacheShapes();
     this._showTitle();
 
     setTimeout(() => {
@@ -49,13 +48,9 @@ class App {
     }, 500);
   }
 
-  _precacheShapes() {
-    const shapes = getAvailableShapes();
-    const budget = getShapeParticleBudget();
-    for (const name of shapes) {
-      this.shapeCache[name] = rasterizeShape(name, 300, budget);
-    }
-  }
+  // Shapes are now rasterized lazily (on first request via _resolvePoints).
+  // Upfront precache blocked the main thread for tens of seconds on
+  // low-powered machines and in Safari — page stayed dark until done.
 
   /**
    * Rasterize the "Thinking Canvas" title into particle targets and hand it
