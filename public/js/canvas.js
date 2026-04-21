@@ -20,7 +20,7 @@
  * States: title-idle → gathering → thinking → forming → settled → dissolving
  */
 
-const PARTICLE_COUNT = 12000;
+const PARTICLE_COUNT = 8000;
 const SAND_COLORS = ['#D4A574', '#C4956A', '#E8C9A0', '#B8845A', '#DEB887', '#C9A882'];
 const EDGE_COLORS = ['#F0D8B0', '#EED5A8', '#F5E0BE', '#E8D0A0'];
 const INTERIOR_COLORS = ['#A07050', '#8C6545', '#977055', '#B08060'];
