@@ -314,53 +314,80 @@ export function rasterizeShape(shapeName, resolution = 300, maxPoints = 30000) {
  * Morphological dilation: each output pixel is set if ANY input pixel within
  * a radius-r disk is set. Out-of-bounds is treated as unset.
  */
+// Separable O(W·H·R) dilation with a Chebyshev (square) kernel. The disk
+// kernel was O(W·H·R²) which, at the sizes we actually use (W=H≈400, R≈20),
+// locked the main thread for ~10-20s on first shape render. A square kernel
+// closes gaps equally well for the downstream point-cloud; the silhouette
+// difference after dilate→erode closing is imperceptible after sampling.
 function dilateMask(mask, W, H, r) {
+  const tmp = new Uint8Array(mask.length);
   const out = new Uint8Array(mask.length);
-  const r2 = r * r;
+  // Horizontal pass: tmp[y,x] = 1 iff any mask[y, x-r..x+r] is set.
   for (let y = 0; y < H; y++) {
+    const off = y * W;
+    let dist = r + 1;
     for (let x = 0; x < W; x++) {
-      if (mask[y * W + x]) { out[y * W + x] = 1; continue; }
-      let hit = 0;
-      for (let dy = -r; dy <= r && !hit; dy++) {
-        const ny = y + dy;
-        if (ny < 0 || ny >= H) continue;
-        for (let dx = -r; dx <= r; dx++) {
-          if (dx * dx + dy * dy > r2) continue;
-          const nx = x + dx;
-          if (nx < 0 || nx >= W) continue;
-          if (mask[ny * W + nx]) { hit = 1; break; }
-        }
-      }
-      if (hit) out[y * W + x] = 1;
+      dist = mask[off + x] ? 0 : dist + 1;
+      if (dist <= r) tmp[off + x] = 1;
+    }
+    dist = r + 1;
+    for (let x = W - 1; x >= 0; x--) {
+      dist = mask[off + x] ? 0 : dist + 1;
+      if (dist <= r) tmp[off + x] = 1;
+    }
+  }
+  // Vertical pass: out[y,x] = 1 iff any tmp[y-r..y+r, x] is set.
+  for (let x = 0; x < W; x++) {
+    let dist = r + 1;
+    for (let y = 0; y < H; y++) {
+      dist = tmp[y * W + x] ? 0 : dist + 1;
+      if (dist <= r) out[y * W + x] = 1;
+    }
+    dist = r + 1;
+    for (let y = H - 1; y >= 0; y--) {
+      dist = tmp[y * W + x] ? 0 : dist + 1;
+      if (dist <= r) out[y * W + x] = 1;
     }
   }
   return out;
 }
 
 /**
- * Morphological erosion: each output pixel remains set only if ALL pixels
- * within a radius-r disk are set. Out-of-bounds is treated as SET so the
- * shape isn't eroded at the canvas boundary (important for icons that span
- * the full bitmap — e.g. the basketball disc touches all four edges).
+ * Morphological erosion with a Chebyshev (square) kernel, separable O(W·H·R).
+ * Out-of-bounds treated as SET so the shape isn't eroded at the canvas
+ * boundary (important for icons that span the full bitmap).
  */
 function erodeMask(mask, W, H, r) {
+  const tmp = new Uint8Array(mask.length);
   const out = new Uint8Array(mask.length);
-  const r2 = r * r;
+  const distBuf = new Int16Array(Math.max(W, H));
+  // Horizontal pass: pixel survives iff no unset pixel within r in its row.
   for (let y = 0; y < H; y++) {
+    const off = y * W;
+    let dist = r + 1;
     for (let x = 0; x < W; x++) {
-      if (!mask[y * W + x]) continue;
-      let stays = true;
-      for (let dy = -r; dy <= r && stays; dy++) {
-        const ny = y + dy;
-        if (ny < 0 || ny >= H) continue;
-        for (let dx = -r; dx <= r; dx++) {
-          if (dx * dx + dy * dy > r2) continue;
-          const nx = x + dx;
-          if (nx < 0 || nx >= W) continue;
-          if (!mask[ny * W + nx]) { stays = false; break; }
-        }
-      }
-      if (stays) out[y * W + x] = 1;
+      dist = mask[off + x] ? dist + 1 : 0;
+      distBuf[x] = dist;
+    }
+    dist = r + 1;
+    for (let x = W - 1; x >= 0; x--) {
+      dist = mask[off + x] ? dist + 1 : 0;
+      const d = distBuf[x] < dist ? distBuf[x] : dist;
+      if (d > r) tmp[off + x] = 1;
+    }
+  }
+  // Vertical pass on tmp.
+  for (let x = 0; x < W; x++) {
+    let dist = r + 1;
+    for (let y = 0; y < H; y++) {
+      dist = tmp[y * W + x] ? dist + 1 : 0;
+      distBuf[y] = dist;
+    }
+    dist = r + 1;
+    for (let y = H - 1; y >= 0; y--) {
+      dist = tmp[y * W + x] ? dist + 1 : 0;
+      const d = distBuf[y] < dist ? distBuf[y] : dist;
+      if (d > r) out[y * W + x] = 1;
     }
   }
   return out;
@@ -433,12 +460,17 @@ function countLargeComponents(mask, W, H, minSize = 500) {
  * Edge pixels are duplicated 3x so more particles cluster on outlines.
  */
 function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library', maxPoints = 30000) {
-  // Render into a canvas that extends past the declared viewBox on every side.
-  // Some generated SVGs (e.g. generated-v2/moo-text.svg) have path points
-  // outside their viewBox — a rigid viewBox-sized canvas clips that content
-  // and the shape renders with half a glyph missing. The pad captures overflow;
-  // actual-content normalization below makes the final coords honest.
-  const OVERFLOW_PAD = 1.0;
+  // Render into a canvas that extends past the declared viewBox. Some SVGs
+  // have path points outside their viewBox (LLM-generated ones most often);
+  // a rigid viewBox-sized canvas clips that content. The pad captures
+  // overflow; actual-content normalization below makes the final coords
+  // honest. `generated` gets a larger buffer because the LLM occasionally
+  // emits viewBox-overflowing strokes; library/emoji/iconify SVGs are
+  // well-formed, so a small safety pad is enough and keeps the raster
+  // bitmap ≈ (1.3×resolution)² — the pad was previously 3× which made
+  // the bitmap 9× larger and pushed the morphological closing pass into
+  // a multi-second main-thread block on first shape render.
+  const OVERFLOW_PAD = shapeSource === 'generated' ? 0.5 : 0.15;
   const padPx = Math.round(resolution * OVERFLOW_PAD);
   const W = resolution + padPx * 2;
   const H = resolution + padPx * 2;
