@@ -923,12 +923,21 @@ export function rasterizeText(text, opts = {}) {
 
   if (!text || typeof text !== 'string') return null;
 
+  // Extra pixel spacing between glyphs. Script faces (Love Light) have
+  // connecting strokes that run letters into one another under the bokeh
+  // particle render — small positive spacing breaks the letters apart so
+  // each one reads as distinct, at the cost of losing the "handwriting
+  // flow" feel.
+  const letterSpacing = opts.letterSpacing || 0;
+  const letterSpacingCss = letterSpacing ? `${letterSpacing}px` : '0px';
+
   // First pass: measure text at the requested font so we can size the
   // bitmap tightly. Browser measureText() returns width; we approximate
   // height from the font-size token.
   const measureCanvas = document.createElement('canvas');
   const measureCtx = measureCanvas.getContext('2d');
   measureCtx.font = font;
+  if ('letterSpacing' in measureCtx) measureCtx.letterSpacing = letterSpacingCss;
   const metrics = measureCtx.measureText(text);
   const textWidth = Math.ceil(metrics.width);
   // Most browsers expose actualBoundingBox* in modern versions. Fall back
@@ -951,6 +960,7 @@ export function rasterizeText(text, opts = {}) {
   ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = 'white';
   ctx.font = font;
+  if ('letterSpacing' in ctx) ctx.letterSpacing = letterSpacingCss;
   ctx.textBaseline = 'alphabetic';
   ctx.fillText(text, padding, padding + ascent);
 
@@ -988,6 +998,11 @@ export function rasterizeText(text, opts = {}) {
     filled = interior;
   }
 
+  // Edge-only mode: for titles, interior glyph fill is what crushes
+  // counters (loops in a/o/g) and bleeds adjacent strokes together under
+  // the soft bokeh particle render. Keeping only the outline gives the
+  // letterforms room to breathe.
+  const edgeOnly = opts.edgeOnly === true;
   const points = [];
   for (const key of filled) {
     const x = key % bitmapW;
@@ -997,6 +1012,7 @@ export function rasterizeText(text, opts = {}) {
       !filled.has((y + 1) * bitmapW + x) ||
       !filled.has(y * bitmapW + (x - 1)) ||
       !filled.has(y * bitmapW + (x + 1));
+    if (edgeOnly && !isEdge) continue;
     points.push({ x: x / bitmapW, y: y / bitmapH, edge: isEdge });
   }
 

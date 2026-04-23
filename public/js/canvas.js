@@ -209,21 +209,36 @@ export class ThinkingCanvas {
     if (!textPoints || textPoints.length === 0) return;
 
     const aspectRatio = textPoints.aspectRatio || 6;
-    const titleWidth = Math.min(this.width * 0.65, this.height * aspectRatio * 0.12);
+    const titleWidth = Math.min(this.width * 0.80, this.height * aspectRatio * 0.17);
     const titleHeight = titleWidth / aspectRatio;
     const centerX = this.width / 2;
-    const centerY = this.height * 0.12;
+    const centerY = this.height * 0.14;
     const offsetX = centerX - titleWidth / 2;
     const offsetY = centerY - titleHeight / 2;
 
-    const basePoints = textPoints.map(p => ({
-      x: offsetX + p.x * titleWidth,
-      y: offsetY + p.y * titleHeight,
-      edge: p.edge ?? false,
-    }));
+    const basePoints = textPoints.map(p => {
+      const bx = offsetX + p.x * titleWidth;
+      const by = offsetY + p.y * titleHeight;
+      const bp = { x: bx, y: by, edge: p.edge ?? false };
+      if (p.seep) {
+        // Seep metadata: the ellipsis trail is static dots; particles
+        // cycle through a per-particle phase (see `_applyShapeRotation`).
+        // `seepDotIndex` drives the left-to-right activation stagger.
+        bp.seep = true;
+        bp.seepHomeX = bx;
+        bp.seepHomeY = by;
+        bp.seepPhaseInit = p.seepPhaseInit ?? Math.random();
+        bp.seepDotIndex = p.seepDotIndex ?? 0;
+      }
+      return bp;
+    });
 
+    // Exclude seep basepoints from the reveal range — the ellipsis should
+    // only start appearing *after* the main phrase is fully written, not
+    // sweep in alongside it.
     let bpMinX = Infinity, bpMaxX = -Infinity;
     for (const bp of basePoints) {
+      if (bp.seep) continue;
       if (bp.x < bpMinX) bpMinX = bp.x;
       if (bp.x > bpMaxX) bpMaxX = bp.x;
     }
@@ -272,7 +287,7 @@ export class ThinkingCanvas {
     if (!textPoints || textPoints.length === 0) return;
 
     const aspectRatio = textPoints.aspectRatio || 4;
-    const titleWidth = Math.min(this.width * 0.7, this.height * aspectRatio * 0.18);
+    const titleWidth = Math.min(this.width * 0.82, this.height * aspectRatio * 0.22);
     const titleHeight = titleWidth / aspectRatio;
     const centerX = this.width / 2;
     const centerY = this.height * 0.18;
@@ -359,7 +374,7 @@ export class ThinkingCanvas {
           p.color = p.baseColor;
         }
       }
-      setTimeout(doAssign, 200);
+      setTimeout(doAssign, 130);
     } else {
       doAssign();
     }
@@ -929,12 +944,99 @@ export class ThinkingCanvas {
         revealX = wr.minX + (wr.maxX - wr.minX) * ease;
       }
 
+      // Ellipsis seep animation: each seep base point is STATIC at its
+      // home position (dots of "..." don't move). Each assigned particle
+      // cycles through a per-particle phase:
+      //   [0.0 - 0.85] tethered at the dot  → visible as a crisp dot
+      //   (0.85 - 1.0] released               → particle dissipates into
+      //                                          the hurricane starting
+      //                                          from the dot's position
+      //                                          (nearest hurricane point,
+      //                                          not a far-away drift)
+      //   wrap                               → particle is teleported
+      //                                          back to the dot (no
+      //                                          visible journey from the
+      //                                          hurricane back)
+      // Gate: the animation only runs once writeReveal has finished, so
+      // the ellipsis only appears after the rest of the phrase.
+      const hasSeep = shape.writeReveal && shape.basePoints.some(bp => bp.seep);
+      if (hasSeep) {
+        const wr = shape.writeReveal;
+        const cycleSec = 5.0;
+        const DOT_STAGGER = 0.28;  // seconds between sequential dot activations
+        const nowSec = performance.now() / 1000;
+        // Time elapsed since the main phrase finished writing. Each dot
+        // activates once postRevealSec passes its seepDotIndex * stagger,
+        // creating a left-to-right "typing" of the ellipsis.
+        const postRevealSec = wr.time - wr.duration;
+        for (let k = 0; k < shape.basePoints.length; k++) {
+          const bp = shape.basePoints[k];
+          if (!bp.seep) continue;
+          const activationAt = (bp.seepDotIndex || 0) * DOT_STAGGER;
+          if (postRevealSec < activationAt) {
+            bp._seepPhase = -1;
+            continue;
+          }
+          const phase = (nowSec / cycleSec + bp.seepPhaseInit) % 1;
+          const prev = bp._seepPhase;
+          const pi = shape.particleIndices[k % shape.particleIndices.length];
+          const p = this.particles[pi];
+          // (a) First activation: the particle was in the hurricane; snap
+          //     it home so the dot materializes cleanly at its position.
+          // (b) Cycle wrap: respawn at home after a released particle
+          //     completes a full lap in the hurricane.
+          // (c) Release transition (phase just crossed 0.85): give a
+          //     tangential velocity kick so the particle streams into the
+          //     hurricane on a curved path rather than falling straight
+          //     down under the radial pull of the swirl.
+          if (p) {
+            if (prev === undefined || prev < 0) {
+              p.x = bp.seepHomeX;
+              p.y = bp.seepHomeY;
+              p.vx = 0;
+              p.vy = 0;
+            } else if (prev > 0.5 && phase < prev - 0.3) {
+              p.x = bp.seepHomeX;
+              p.y = bp.seepHomeY;
+              p.vx = 0;
+              p.vy = 0;
+            } else if (prev <= 0.85 && phase > 0.85) {
+              // Tangential kick around the canvas-center hurricane: take
+              // the perpendicular to the vector from hurricane center to
+              // the particle, then push it along that tangent so it swirls
+              // into the vortex instead of plummeting to center.
+              const cx = this.width / 2;
+              const cy = this.height / 2;
+              const rx = p.x - cx;
+              const ry = p.y - cy;
+              const rLen = Math.sqrt(rx * rx + ry * ry) || 1;
+              const tx = -ry / rLen;
+              const ty = rx / rLen;
+              const kick = 2.4;
+              p.vx += tx * kick + 0.6;  // + slight outward bias (rightward)
+              p.vy += ty * kick;
+            }
+          }
+          bp._seepPhase = phase;
+        }
+      }
+
       // Write targets: each particle tracks its assigned basePoint.
       for (let k = 0; k < shape.particleIndices.length; k++) {
         const pi = shape.particleIndices[k];
         const bp = shape.basePoints[k % shape.basePoints.length];
 
-        if (bp.x > revealX) {
+        // Seep particles: pre-reveal they sit in the hurricane (phase = -1);
+        // mid-cycle they're tethered at the static dot; near end-of-cycle
+        // they release to dissipate into the hurricane at the dot's
+        // position. The teleport above handles respawn at wrap.
+        if (bp.seep) {
+          if (bp._seepPhase === undefined || bp._seepPhase < 0 || bp._seepPhase > 0.85) {
+            this.particles[pi].targetX = null;
+            this.particles[pi].targetY = null;
+            continue;
+          }
+        } else if (bp.x > revealX) {
           this.particles[pi].targetX = null;
           this.particles[pi].targetY = null;
           continue;

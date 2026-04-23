@@ -18,10 +18,9 @@ import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape } from
 import { loadLottieShape } from './lottie-rasterizer.js';
 
 // How long each shape stays on screen during the crossfade cycle (ms).
-// Also the pause before/after the carousel swap. 2s is the sweet spot —
-// long enough to register the silhouette and label, short enough that 3
-// shapes cycle in ~6s before the group view.
-const CYCLE_MS = 2000;
+// Also the pause before/after the carousel swap. 1.5s keeps the cadence
+// snappy — shapes read clearly but the turn moves along without dragging.
+const CYCLE_MS = 1500;
 
 function nextFrame() {
   return new Promise(resolve => requestAnimationFrame(resolve));
@@ -63,6 +62,8 @@ class App {
       font: "400 140px 'Love Light', cursive",
       maxPoints: titleBudget,
       alphaThreshold: 128,
+      edgeOnly: true,
+      letterSpacing: 8,
     });
     if (points) {
       this.canvas.setTitle(points, 'Thinking Canvas');
@@ -373,15 +374,64 @@ class App {
   }
 
   _showThinkingTitle() {
-    const budget = Math.floor(getShapeParticleBudget() * 0.15);
-    const points = rasterizeText('I\'m thinking about...', {
-      font: "400 100px 'Love Light', cursive",
-      maxPoints: budget,
+    // Budget slightly boosted over the old 0.15 — we're allocating ~20% of
+    // it to the trailing ellipsis that seeps into the hurricane.
+    const budget = Math.floor(getShapeParticleBudget() * 0.18);
+    const points = rasterizeText('I\'m thinking about', {
+      font: "400 150px 'Love Light', cursive",
+      maxPoints: Math.floor(budget * 0.80),
       alphaThreshold: 128,
+      edgeOnly: true,
+      letterSpacing: 10,
     });
-    if (points) {
-      this.canvas.setThinkingTitle(points);
+    if (!points) return;
+
+    // Discrete trail of dots extending from the end of "about". Each dot
+    // is a small round cluster; the dots are stationary (no rightward drift
+    // in the animation). Particles at each dot cycle through a per-particle
+    // phase — most of the cycle they sit at the dot; near the end of the
+    // cycle they're released into the hurricane (dissipating in place at
+    // the dot's position); at wrap the particle is teleported back to the
+    // dot. Net visual: discrete, recognizable "..." trail where each dot
+    // subtly shimmers with particles coming and going.
+    const textMaxY = points.reduce((m, p) => p.y > m ? p.y : m, 0);
+    const textMinY = points.reduce((m, p) => p.y < m ? p.y : m, 1);
+    const centerY = (textMinY + textMaxY) / 2;
+    const glyphHeight = textMaxY - textMinY;
+    const numDots = 3;
+    const dotParticles = 10;  // tight dots — a handful of particles each
+    const dotRadius = glyphHeight * 0.022;
+    // Three small dots forming a plain ellipsis right after "about".
+    const trailStart = 1.02;
+    const trailEnd = 1.12;
+    const dotY = centerY + glyphHeight * 0.12;
+    const trail = [];
+    for (let i = 0; i < numDots; i++) {
+      const t = numDots === 1 ? 0 : i / (numDots - 1);
+      const xCenter = trailStart + t * (trailEnd - trailStart);
+      for (let k = 0; k < dotParticles; k++) {
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * dotRadius;
+        trail.push({
+          x: xCenter + Math.cos(a) * r * 0.6,
+          y: dotY + Math.sin(a) * r,
+          edge: true,
+          seep: true,
+          // Constrain initial phase to the "tethered" portion of the cycle
+          // (0..0.6) so a freshly-activated dot doesn't have half its
+          // particles immediately in the release window — they all get a
+          // full moment of visibility before any start streaming off.
+          seepPhaseInit: Math.random() * 0.6,
+          // Left-to-right activation order: dot 0 lights up first, dot 7
+          // last — gives the "typing the ellipsis in" feel instead of all
+          // dots appearing simultaneously.
+          seepDotIndex: i,
+        });
+      }
     }
+    const combined = points.concat(trail);
+    combined.aspectRatio = points.aspectRatio;
+    this.canvas.setThinkingTitle(combined);
   }
 
   _clearConceptCycle() {
