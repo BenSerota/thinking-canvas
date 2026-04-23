@@ -125,5 +125,22 @@
   "scale": { "library": "scale-balanced" },
   "balance": { "library": "scale-balanced" },
   "justice": { "library": "scale-balanced" },
-  "gavel": { "library": "gavel" }
+  "gavel": { "library": "gavel" },
+
+  "infinity": { "library": "infinity" },
+  "infinity-symbol": { "library": "infinity" },
+  "infinity-sign": { "library": "infinity" },
+  "lemniscate": { "library": "infinity" },
+
+  "blood-clot": { "library": "droplet" },
+  "clot": { "library": "droplet" },
+  "blood-droplet": { "library": "droplet" },
+  "blood-drop": { "library": "droplet" },
+  "blood": { "library": "droplet" },
+  "ecg": { "library": "ecg-heart" },
+  "heartbeat": { "library": "ecg-heart" },
+  "heart-rhythm": { "library": "ecg-heart" },
+  "heart-rate": { "library": "ecg-heart" },
+  "cardiogram": { "library": "ecg-heart" },
+  "electrocardiogram": { "library": "ecg-heart" }
 }

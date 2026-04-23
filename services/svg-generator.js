@@ -155,7 +155,13 @@ function validate(svgText, { iconic = '' } = {}) {
 
   let doc;
   try {
-    doc = new DOMParser({ errorHandler: { warning: () => {}, error: () => {}, fatalError: (e) => { throw e; } } }).parseFromString(svgText, 'image/svg+xml');
+    // @xmldom/xmldom ≥0.9 replaced the `errorHandler` object with a single
+    // `onError(level, msg, ctx)` callback. The old option is a hard error —
+    // which would silently break the entire on-demand generation tier and
+    // send every novel concept to the builtin "question mark" fallback.
+    doc = new DOMParser({
+      onError: (level, msg) => { if (level === 'fatalError') throw new Error(msg); },
+    }).parseFromString(svgText, 'image/svg+xml');
   } catch (e) {
     return { ok: false, reason: 'xml parse failure: ' + e.message };
   }

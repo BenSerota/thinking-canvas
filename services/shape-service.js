@@ -101,11 +101,18 @@ function normalizeBuiltin(shape) {
 /**
  * Resolve one Haiku visual to a renderable shape reference.
  *   visual: { iconic: string, shape: string }
+ *   excludeNames: Set<string> of resolved names already taken by earlier
+ *                 concepts in the same turn. When a tier's candidate is in
+ *                 this set, we skip it and fall through — otherwise two
+ *                 related concepts (e.g. "chromosome" and "dna double
+ *                 helix", both of which tag to the bundled `dna` Lottie)
+ *                 would collide and one would be deduped away by the
+ *                 streaming caller, leaving the carousel with a short count.
  * Returns { name, concept, dynamic, source, score? }
  *   - `concept` is the display label (Haiku's original iconic phrase, falling
  *     back to the builtin shape name if iconic was absent).
  */
-async function resolveVisual(visual) {
+async function resolveVisual(visual, excludeNames = new Set()) {
   const iconic = visual && visual.iconic ? String(visual.iconic).trim() : '';
   const builtinFallback = normalizeBuiltin(visual && visual.shape);
   // Display label: prefer the human-readable iconic phrase; fall back to the
@@ -118,7 +125,7 @@ async function resolveVisual(visual) {
     // categorically better than any static icon or curated override.
     try {
       const lottieMatch = await lottieService.findAnimation(iconic);
-      if (lottieMatch) {
+      if (lottieMatch && !excludeNames.has(lottieMatch.name)) {
         return {
           name: lottieMatch.name,
           concept,
@@ -135,7 +142,7 @@ async function resolveVisual(visual) {
     // 0.5. Hand-curated override — wins over the matcher and generator
     // for concepts where they pick the wrong icon or produce a blob.
     const curated = resolveCurated(iconic, concept);
-    if (curated) return curated;
+    if (curated && !excludeNames.has(curated.name)) return curated;
 
     // 0.7. Library exact-match — if the iconic phrase kebab-matches a library
     // icon name directly (e.g. "lightbulb" → lightbulb.svg, "volcano" →
@@ -143,7 +150,7 @@ async function resolveVisual(visual) {
     // chance to return a wrong match (plug for lightbulb, person for volcano).
     if (await iconMatcher.hasExactMatch(iconic)) {
       const exactMatch = await iconMatcher.findBestMatch(iconic, { threshold: 0 });
-      if (exactMatch && exactMatch.score >= 1.0) {
+      if (exactMatch && exactMatch.score >= 1.0 && !excludeNames.has(exactMatch.name)) {
         const subdir = exactMatch.source === 'generated' ? svgGenerator.GENERATED_SUBDIR : 'library';
         return {
           name: exactMatch.name,
@@ -168,7 +175,7 @@ async function resolveVisual(visual) {
     // beats hand-drawn character.
     try {
       const emoji = await emojiService.findBestMatch(iconic);
-      if (emoji) {
+      if (emoji && !excludeNames.has(`emoji-${emoji.hexcode}`)) {
         return {
           name: `emoji-${emoji.hexcode}`,
           concept,
@@ -188,7 +195,7 @@ async function resolveVisual(visual) {
     // silhouettes. On any failure (timeout, no match, sanitize reject)
     // returns null and we fall through to the local matcher.
     const iconify = await iconifyService.findAndCache(iconic);
-    if (iconify) {
+    if (iconify && !excludeNames.has(iconify.name)) {
       return {
         name: iconify.name,
         concept,
@@ -200,7 +207,7 @@ async function resolveVisual(visual) {
 
     // 3. Library / cached-generated match
     const match = await iconMatcher.findBestMatch(iconic, { threshold: EMBEDDING_THRESHOLD });
-    if (match) {
+    if (match && !excludeNames.has(match.name)) {
       // Determine which directory the SVG lives in. Generated icons live in
       // a versioned subdir (see svg-generator.js GENERATED_SUBDIR); library
       // icons live in `library/`.
@@ -218,7 +225,7 @@ async function resolveVisual(visual) {
 
     // 3. On-demand generation with strict validation
     const gen = await svgGenerator.generate(iconic);
-    if (gen && gen.ok) {
+    if (gen && gen.ok && !excludeNames.has(gen.name)) {
       return {
         name: gen.name,
         concept,
@@ -235,11 +242,11 @@ async function resolveVisual(visual) {
     for (let i = 1; i < words.length; i++) {
       const suffix = words.slice(i).join(' ');
       const iconify = await iconifyService.findAndCache(suffix);
-      if (iconify) {
+      if (iconify && !excludeNames.has(iconify.name)) {
         return { name: iconify.name, concept, dynamic: iconify.url, source: 'iconify', score: 1.0 };
       }
       const match = await iconMatcher.findBestMatch(suffix, { threshold: EMBEDDING_THRESHOLD });
-      if (match) {
+      if (match && !excludeNames.has(match.name)) {
         const subdir = match.source === 'generated' ? svgGenerator.GENERATED_SUBDIR : 'library';
         return {
           name: match.name, concept,
@@ -287,7 +294,7 @@ async function* streamConceptShapes(visuals, max = 3) {
 
   for (const visual of visuals) {
     if (yielded >= max) break;
-    const resolved = await resolveVisual(visual);
+    const resolved = await resolveVisual(visual, seen);
     if (seen.has(resolved.name)) continue;
     seen.add(resolved.name);
     yielded++;

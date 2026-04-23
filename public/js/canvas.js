@@ -623,13 +623,15 @@ export class ThinkingCanvas {
       if (inRange < 20) continue;  // shape too flat to meaningfully check
 
       // Check which base-point Y values the assigned particle slots will
-      // visit (targets are set per-frame in _applyShapeRotation; we can't
-      // read them here, but the slots walk basePoints[k % length] — same
-      // shape, just offset in time).
+      // visit. The target-set loop in _applyShapeRotation walks basePoints
+      // with a stride when slots < basePoints.length — mirror that here so
+      // the assert reflects the actual sampled indices.
       let outMinY = Infinity, outMaxY = -Infinity;
       const slots = shape.particleIndices.length;
+      const strideAssert = slots > 0 && slots < bp.length ? (bp.length / slots) : 0;
       for (let k = 0; k < slots; k++) {
-        const by = bp[k % bp.length].y;
+        const idx = strideAssert > 0 ? Math.floor(k * strideAssert) : (k % bp.length);
+        const by = bp[idx].y;
         if (by < outMinY) outMinY = by;
         if (by > outMaxY) outMaxY = by;
       }
@@ -1022,9 +1024,20 @@ export class ThinkingCanvas {
       }
 
       // Write targets: each particle tracks its assigned basePoint.
-      for (let k = 0; k < shape.particleIndices.length; k++) {
+      // When we have fewer slots than basePoints (carousel divides the
+      // budget across N shapes), stride through basePoints so coverage is
+      // uniform. Without this, animated Lottie shapes (which store static
+      // points first, dynamic after) would only assign particles to the
+      // static nucleus — the dynamic/animated portion would be invisible
+      // (e.g. DNA helix losing its rungs, leaving just the two rails).
+      const bpLen = shape.basePoints.length;
+      const pLen = shape.particleIndices.length;
+      const useStride = pLen > 0 && pLen < bpLen;
+      const stride = useStride ? bpLen / pLen : 1;
+      for (let k = 0; k < pLen; k++) {
         const pi = shape.particleIndices[k];
-        const bp = shape.basePoints[k % shape.basePoints.length];
+        const bpIdx = useStride ? Math.floor(k * stride) : (k % bpLen);
+        const bp = shape.basePoints[bpIdx];
 
         // Seep particles: pre-reveal they sit in the hurricane (phase = -1);
         // mid-cycle they're tethered at the static dot; near end-of-cycle
