@@ -1,11 +1,11 @@
 # Thinking Canvas
 
-An AI chat interface where 12,000 sand-grain particles form shapes that visualize Claude's thoughts in real time. As you talk, watch the canvas -- you'll see concepts take shape as particle silhouettes, animated Lottie figures, and flowing formations.
+An AI chat interface where 8,000 sand-grain particles form shapes that visualize what Claude is working on, in real time. As you talk, watch the canvas -- you'll see concepts take shape as particle silhouettes, animated Lottie figures, and flowing formations.
 
 ## How It Works
 
 1. You send a message in the chat panel
-2. Claude responds with extended thinking, which triggers a visual concept extractor (Haiku) to identify key ideas
+2. Claude responds with extended thinking while, in parallel, a visual concept extractor (Haiku) pulls key ideas from your message
 3. Each concept is resolved to a shape through a multi-tier pipeline: Lottie animations, curated icons, OpenMoji emoji, Iconify web icons, local library matching, or on-demand SVG generation
 4. Particles flow from a hurricane formation into the resolved shape, then cycle through concepts before arranging on a carousel
 
@@ -39,7 +39,7 @@ The icon library and emoji embeddings must be built before the first run:
 
 ```bash
 npm run setup-icons    # Downloads ~5,500 icons and builds embeddings (~60s)
-npm run setup-emoji    # Downloads OpenMoji SVGs and builds embeddings (~30s)
+npm run setup-emoji    # Builds the emoji embeddings index (~30s; the OpenMoji SVGs ship with the repo)
 ```
 
 Lottie animations are pre-built and tracked in git. To regenerate them:
@@ -79,6 +79,11 @@ public/js/             Frontend modules (canvas physics, chat UI, shape rasteriz
 public/shapes/         Shape assets (curated, emoji, Lottie, generated caches)
 scripts/               Build scripts for icons, emoji, and Lottie assets
 ```
+
+## Attribution
+
+- Emoji silhouettes: [OpenMoji](https://openmoji.org) (CC BY-SA 4.0, HfG Schwäbisch Gmünd) — ~2,400 SVGs vendored in `public/shapes/emoji/`.
+- Animation playback: [lottie-web](https://github.com/airbnb/lottie-web) (MIT), vendored as `public/js/vendor/lottie_light.min.js`.
 
 ## License
 
