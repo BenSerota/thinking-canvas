@@ -43,11 +43,12 @@ const SEARCH_LIMIT = 8;
 const MAX_CANDIDATE_FETCHES = 4;
 const NEGATIVE_TTL_MS = 60 * 60 * 1000;
 
-// Commercial-safe OSS licenses only. Iconify exposes the SPDX ID per set in
-// the search response (collections[prefix].license.spdx). We exclude
-// share-alike (CC-BY-SA) and non-commercial (CC-BY-NC*) because shipping a
-// derivative under a proprietary-compatible license conflicts with the
-// share-alike clause.
+// Open licenses we can attribute. Iconify exposes the SPDX ID per set in
+// the search response (collections[prefix].license.spdx). Attribution and
+// share-alike are honoured: THIRD-PARTY-LICENSES.md credits every source
+// and each cached icon carries a sidecar JSON with its set and license, so
+// CC-BY and CC-BY-SA sets are fine (the OpenMoji tier is CC-BY-SA too).
+// Non-commercial (CC-BY-NC*) sets stay excluded.
 const LICENSE_WHITELIST = new Set([
   'MIT',
   'Apache-2.0',
@@ -55,6 +56,7 @@ const LICENSE_WHITELIST = new Set([
   'CC0-1.0',
   'CC-BY-4.0',
   'CC-BY-3.0',
+  'CC-BY-SA-4.0',
   'ISC',
   'BSD-2-Clause',
   'BSD-3-Clause',
@@ -245,15 +247,23 @@ async function findAndCache(iconic) {
   const kebab = toKebab(iconic);
   if (!kebab) return null;
 
-  // 1. Disk cache hit — no network
+  // 1. Disk cache hit — no network. The sidecar JSON written alongside the
+  //    SVG carries the icon set and license so attribution survives the cache.
   const cachePath = path.join(CACHE_DIR, `${kebab}.svg`);
+  const sidecarPath = path.join(CACHE_DIR, `${kebab}.json`);
   if (fs.existsSync(cachePath)) {
     console.log(`[iconify] "${iconic}" → cache hit ${kebab}.svg`);
+    let meta = null;
+    try {
+      meta = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8'));
+    } catch (_) {
+      // Pre-sidecar cache entry — provenance unknown.
+    }
     return {
       name: kebab,
       url: `${CACHE_URL_PREFIX}/${kebab}.svg`,
-      prefix: null, // unknown on cache hit
-      license: null,
+      prefix: meta ? meta.prefix : null,
+      license: meta && meta.license ? meta.license.title : null,
       source: 'iconify',
     };
   }
@@ -309,15 +319,24 @@ async function findAndCache(iconic) {
     if (!clean) continue;
 
     // 5. Cache to disk under the original concept's kebab so future lookups
-    //    hit step 1. Not the icon's own name — we key on user intent.
+    //    hit step 1. Not the icon's own name — we key on user intent. The
+    //    sidecar records where the icon came from and under which license.
+    const col = collections[prefix] || {};
+    const license = (col.license && col.license.title) || 'unknown';
     try {
       fs.writeFileSync(cachePath, clean, 'utf-8');
+      fs.writeFileSync(sidecarPath, JSON.stringify({
+        prefix,
+        iconName,
+        set: col.name || prefix,
+        license: { spdx: (col.license && col.license.spdx) || null, title: license, url: (col.license && col.license.url) || null },
+        author: (col.author && col.author.name) || null,
+        fetchedAt: new Date().toISOString(),
+      }, null, 2), 'utf-8');
     } catch (err) {
       console.warn(`[iconify] cache write failed for "${iconic}":`, err.message);
       return null;
     }
-
-    const license = (collections[prefix] && collections[prefix].license && collections[prefix].license.title) || 'unknown';
     console.log(`[iconify] "${iconic}" → ${prefix}:${iconName} (${license})`);
     return {
       name: kebab,

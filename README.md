@@ -82,6 +82,6 @@ public/shapes/         Shape assets (curated, emoji, Lottie, generated caches)
 scripts/               Build scripts for icons, emoji, and Lottie assets
 ```
 
-## License
+## Licenses
 
-MIT
+The code is MIT (see `LICENSE`). The shape assets are not: OpenMoji emoji are CC BY-SA 4.0, Font Awesome Free icons are CC BY 4.0, Material Symbols are Apache 2.0, and Iconify icons carry their own set's license (recorded in a sidecar JSON next to each cached file). See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for the full attributions, which must travel with any redistribution of `public/shapes/`.

@@ -85,6 +85,27 @@ html, body {
   text-transform: uppercase;
 }
 
+#attribution {
+  position: absolute;
+  right: 12px;
+  bottom: 8px;
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  pointer-events: auto;
+  text-align: right;
+}
+
+#attribution a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+}
+
+#attribution a:hover {
+  color: var(--text-secondary);
+}
+
 /* Subtle vignette effect on canvas */
 #canvasPanel::after {
   content: '';
