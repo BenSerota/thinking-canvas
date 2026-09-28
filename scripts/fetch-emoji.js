@@ -14,9 +14,13 @@
  *
  * License:
  *   OpenMoji — CC-BY-SA 4.0 (© HfG Schwäbisch Gmünd / openmoji.org).
- *   Using the `black` (line-art) set because our stroke-following rasterizer
- *   (public/js/shapes.js → particlesFromGeomElements) expects stroke geometry
- *   with fill="none".
+ *   Using the `black` (line-art) set. Note that "line art" is not
+ *   "stroke-only": about a quarter of the files also contain filled
+ *   geometry (eye dots, letter glyphs), most use basic shapes
+ *   (<circle>/<rect>/<line>…), and ~5% carry transforms. The client loader
+ *   (public/js/shapes.js → loadExternalShape) routes every element by its
+ *   own resolved fill/stroke and honours transforms; the per-file `render`
+ *   metadata recorded below documents what each file contains.
  *
  * Idempotent: checks `data/emoji-catalog.json` ↔ release tag; skips work if
  * already up to date. Delete the catalog file to force a re-fetch.
@@ -29,6 +33,45 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const os = require('os');
+const { DOMParser } = require('@xmldom/xmldom');
+
+const GEOM_TAGS = new Set(['path', 'line', 'polyline', 'polygon', 'circle', 'ellipse', 'rect']);
+
+/** Nearest declared attribute up the ancestor chain (SVG inheritance). */
+function resolveAttr(el, name) {
+  for (let node = el; node && node.nodeType === 1; node = node.parentNode) {
+    const v = node.getAttribute(name);
+    if (v != null && v !== '') return v.trim();
+  }
+  return null;
+}
+
+/**
+ * Summarise what the client loader will find in an SVG: how many geometry
+ * elements, what share of them are stroke-only, and whether any transform
+ * is present. Purely informational — the loader dispatches per element.
+ */
+function describeSvg(svgText) {
+  const doc = new DOMParser({ onError() {} }).parseFromString(svgText, 'image/svg+xml');
+  const els = [];
+  const walk = (node) => {
+    if (!node || node.nodeType !== 1) return;
+    if (GEOM_TAGS.has(String(node.localName || node.tagName).toLowerCase())) els.push(node);
+    for (let c = node.firstChild; c; c = c.nextSibling) walk(c);
+  };
+  walk(doc.documentElement);
+  let strokeOnly = 0;
+  for (const el of els) {
+    const fill = resolveAttr(el, 'fill');
+    const stroke = resolveAttr(el, 'stroke');
+    if (fill === 'none' && stroke && stroke !== 'none') strokeOnly++;
+  }
+  return {
+    geomCount: els.length,
+    strokeOnlyRatio: els.length ? +(strokeOnly / els.length).toFixed(2) : 0,
+    hasTransform: /\btransform\s*=/.test(svgText),
+  };
+}
 
 const ROOT = path.resolve(__dirname, '..');
 const OUT_DIR = path.join(ROOT, 'public', 'shapes', 'emoji');
@@ -109,8 +152,8 @@ async function main() {
   if (!svgSrc) throw new Error('Could not locate hex-named SVGs in the unzipped OpenMoji release');
 
   // 4) Filter + copy. Skip skintone variants (same silhouette as base emoji).
-  //    Each kept SVG is copied verbatim — OpenMoji files are already viewBox-
-  //    correct with stroke-only paths that our new stroke rasterizer handles.
+  //    Each kept SVG is copied verbatim (viewBox-correct as shipped) and
+  //    described so the catalog records what the loader will encounter.
   const catalog = [];
   let copied = 0, skippedSkintone = 0, missingSvg = 0;
   for (const entry of rawCatalog) {
@@ -120,12 +163,19 @@ async function main() {
     if (!fs.existsSync(src)) { missingSvg++; continue; }
     const dst = path.join(OUT_DIR, fname);
     fs.copyFileSync(src, dst);
+    let render = null;
+    try {
+      render = describeSvg(fs.readFileSync(src, 'utf-8'));
+    } catch (_) {
+      // Metadata is best-effort; the file itself is what matters.
+    }
     catalog.push({
       hexcode: entry.hexcode,
       emoji: entry.emoji,
       annotation: entry.annotation,
       tags: entry.tags,
       group: entry.group,
+      render,
     });
     copied++;
   }
