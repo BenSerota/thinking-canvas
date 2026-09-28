@@ -7,9 +7,14 @@
  * 2. User sends: title dissolves into gathering → thinking → hurricane ramps up.
  * 3. Shapes stream in one-by-one (crossfade): viewer sees Claude's "current
  *    thought" as each concept arrives.
- * 4. concepts_done: all streamed shapes arrange side-by-side and rotate slowly
- *    in place. Free particles orbit each shape as its own mini-hurricane.
+ * 4. concepts_done: any shapes not yet shown get their turn, then all of them
+ *    arrange on the carousel. A turn with one shape keeps it; a turn with
+ *    none settles back to idle.
  * 5. Next user message: everything dissolves back to the hurricane. Repeat.
+ *
+ * Every timer captures the turn id it was started in and bails if a newer
+ * turn has begun, so a follow-up sent mid-countdown can never have the
+ * previous turn's carousel painted over it.
  */
 
 import { ThinkingCanvas, getShapeParticleBudget } from './canvas.js';
@@ -18,9 +23,14 @@ import { rasterizeShape, loadExternalShape, rasterizeText, conceptToShape } from
 import { loadLottieShape } from './lottie-rasterizer.js';
 
 // How long each shape stays on screen during the crossfade cycle (ms).
-// Also the pause before/after the carousel swap. 1.5s keeps the cadence
+// Also the pause before/after the carousel swap. 1.5 s keeps the cadence
 // snappy — shapes read clearly but the turn moves along without dragging.
 const CYCLE_MS = 1500;
+
+const TITLE_FONT = "400 140px 'Love Light', cursive";
+const THINKING_FONT = "400 150px 'Love Light', cursive";
+// Never hold the canvas hostage to a font CDN.
+const FONT_WAIT_MS = 2000;
 
 function nextFrame() {
   return new Promise(resolve => requestAnimationFrame(resolve));
@@ -31,14 +41,17 @@ class App {
     this.canvas = new ThinkingCanvas(document.getElementById('thinkingCanvas'));
     this.chat = new ChatPanel(document.getElementById('chatPanel'), (msg) => this.handleUserMessage(msg));
     this.shapeCache = {};
-    // Shapes accumulated during the current turn — used for the side-by-side
-    // view once concepts_done arrives.
+    // Shapes accumulated during the current turn — used for the carousel
+    // once concepts_done arrives.
     this.turnShapes = [];
     this.currentConcepts = [];
     this.conceptIndex = 0;
     this.conceptTimer = null;
+    this.carouselTimer = null;
+    // Monotonic turn id — see the file header.
+    this.turnId = 0;
 
-    this._showTitle();
+    this._init();
 
     setTimeout(() => {
       this.chat.addMessage('assistant',
@@ -47,7 +60,27 @@ class App {
     }, 500);
   }
 
-  // Shapes are now rasterized lazily (on first request via _resolvePoints).
+  async _init() {
+    await this._fontsReady();
+    this._showTitle();
+  }
+
+  /**
+   * Resolve once the script face is usable (or after FONT_WAIT_MS). Titles
+   * are rasterized from canvas text, so drawing before the web font arrives
+   * would bake the fallback face into the particles for the whole session.
+   */
+  async _fontsReady() {
+    if (!document.fonts || typeof document.fonts.load !== 'function') return;
+    const timeout = new Promise(resolve => setTimeout(resolve, FONT_WAIT_MS));
+    try {
+      await Promise.race([document.fonts.load(TITLE_FONT), timeout]);
+    } catch (_) {
+      // Font failed to load — fall back to whatever the browser has.
+    }
+  }
+
+  // Shapes are rasterized lazily (on first request via _resolvePoints).
   // Upfront precache blocked the main thread for tens of seconds on
   // low-powered machines and in Safari — page stayed dark until done.
 
@@ -59,7 +92,7 @@ class App {
   _showTitle() {
     const titleBudget = Math.floor(getShapeParticleBudget() * 0.25);
     const points = rasterizeText('Thinking Canvas', {
-      font: "400 140px 'Love Light', cursive",
+      font: TITLE_FONT,
       maxPoints: titleBudget,
       alphaThreshold: 128,
       edgeOnly: true,
@@ -73,6 +106,7 @@ class App {
   }
 
   async handleUserMessage(text) {
+    this.turnId++;
     this.chat.setInputEnabled(false);
 
     // Release all particles (including title) into the gathering → hurricane.
@@ -82,6 +116,10 @@ class App {
 
     // Show "I'm thinking about..." immediately as the hurricane forms.
     this._showThinkingTitle();
+
+    let reader = null;
+    let stream = null;
+    let thinking = null;
 
     try {
       const response = await fetch('/api/chat/stream', {
@@ -98,10 +136,8 @@ class App {
         throw new Error(`Chat request failed (${response.status})`);
       }
 
-      const reader = response.body.getReader();
+      reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let stream = null;
-      let thinking = null;
       let buffer = '';
 
       while (true) {
@@ -159,7 +195,6 @@ class App {
               break;
 
             case 'done':
-              if (stream) stream.finish();
               break;
           }
         }
@@ -168,8 +203,15 @@ class App {
       console.error('Chat error:', error);
       this._settleEmptyTurn();
       this.chat.addMessage('assistant', 'Sorry, something went wrong. Please try again.');
+    } finally {
+      // Whatever happened, the reply bubble must stop blinking and land in
+      // the history, and the connection must not linger.
+      if (stream) stream.finish();
+      if (thinking) thinking.finish();
+      if (reader) reader.cancel().catch(() => {});
     }
 
+    if (this.turnShapes.length === 0) this._settleEmptyTurn();
     this.chat.setInputEnabled(true);
   }
 
@@ -177,13 +219,15 @@ class App {
    * Handle a single concept_resolved SSE event. During streaming, shapes
    * still crossfade one-by-one (that's the dramatic beat — viewer sees each
    * thought take shape in turn). We also collect them into turnShapes so
-   * concepts_done can flip into side-by-side.
+   * concepts_done can flip into the carousel.
    */
   async _onConceptResolved(shape) {
+    const turn = this.turnId;
+
     // Resolve the shape's points ONCE — we'll need them again for the
-    // side-by-side switch. Cache on the shape object.
+    // carousel. Cache on the shape object.
     const resolved = await this._resolvePoints(shape);
-    if (!resolved) return;
+    if (!resolved || turn !== this.turnId) return;
 
     // Animated shapes return a descriptor { isAnimated, frames, fps, points }.
     // Static shapes return a plain point array. Normalize both into _points
@@ -196,12 +240,11 @@ class App {
       shape._animated = null;
     }
     const points = shape._points;
-    if (!points) return;
+    if (!points || points.length === 0) return;
     this.turnShapes.push(shape);
 
-    // Crossfade behavior during streaming, same as before.
+    // First shape of the turn: show it right away.
     if (this.currentConcepts.length === 0) {
-      this.canvas.interimMode = false;
       this._clearConceptCycle();
       this.currentConcepts = [shape];
       this.conceptIndex = 0;
@@ -211,10 +254,10 @@ class App {
 
     this.currentConcepts.push(shape);
 
-    // Rotate through shapes while we wait for concepts_done. 2s per shape
-    // is snappy enough to feel responsive without flicker.
+    // Rotate through shapes while we wait for concepts_done.
     if (this.currentConcepts.length === 2 && !this.conceptTimer) {
       this.conceptTimer = setInterval(() => {
+        if (turn !== this.turnId) return;
         this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
         this._showCurrentConcept('crossfade');
       }, CYCLE_MS);
@@ -223,13 +266,9 @@ class App {
 
   /**
    * All shapes for this turn have arrived. Every turn follows the same
-   * two-phase arc: (1) cycle through each remaining unshown shape at 2s
-   * intervals so the viewer sees every concept individually, (2) then
-   * arrange all shapes on the circular carousel together.
-   *
-   * If the server resolves shapes quickly, most still haven't been shown
-   * by the time this fires — so we step through them here before the
-   * carousel, rather than immediately swapping to the group view.
+   * two-phase arc: (1) cycle through each remaining unshown shape at
+   * CYCLE_MS intervals so the viewer sees every concept individually,
+   * (2) then arrange all shapes on the circular carousel together.
    */
   async _onConceptsDone() {
     const allShapes = this.turnShapes.filter(s => s._points && s._points.length > 0);
@@ -276,7 +315,10 @@ class App {
    * `setShapes` to arrange them all on the circular carousel.
    */
   _scheduleCarousel(shapesForCarousel, stepsLeft) {
+    const turn = this.turnId;
     const launch = () => {
+      this.carouselTimer = null;
+      if (turn !== this.turnId) return;
       this._clearConceptCycle();
       this.canvas.setShapes(shapesForCarousel);
     };
@@ -284,12 +326,13 @@ class App {
     if (stepsLeft <= 0) {
       // Everything already shown — brief pause on the last shape, then
       // fan them out onto the ring.
-      setTimeout(launch, CYCLE_MS);
+      this.carouselTimer = setTimeout(launch, CYCLE_MS);
       return;
     }
 
     let remaining = stepsLeft;
     this.conceptTimer = setInterval(() => {
+      if (turn !== this.turnId) return;
       this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
       this._showCurrentConcept('crossfade');
       remaining--;
@@ -297,15 +340,15 @@ class App {
         clearInterval(this.conceptTimer);
         this.conceptTimer = null;
         // Show the final shape for a moment, then carousel.
-        setTimeout(launch, CYCLE_MS);
+        this.carouselTimer = setTimeout(launch, CYCLE_MS);
       }
     }, CYCLE_MS);
   }
 
   /**
-   * Resolve a shape info object to its particle point cloud.
-   * Factored out of _showCurrentConcept so _onConceptResolved can
-   * pre-resolve for later reuse in setShapes.
+   * Resolve a shape info object to its particle point cloud. An empty
+   * point cloud is a miss (falls through to the next source), never a
+   * shape — `setShape([])` would dissolve the whole canvas.
    */
   async _resolvePoints(info) {
     let points = null;
@@ -317,7 +360,7 @@ class App {
       if (this.shapeCache[cacheKey]) return this.shapeCache[cacheKey];
 
       const result = await loadLottieShape(info.dynamic, 300, getShapeParticleBudget(), 24);
-      if (result && result.frames.length > 0) {
+      if (result && result.frames.length > 0 && result.frames[0].length > 0) {
         const descriptor = {
           isAnimated: true,
           frames: result.frames,
@@ -336,8 +379,11 @@ class App {
       if (this.shapeCache[cacheKey]) {
         points = this.shapeCache[cacheKey];
       } else {
-        points = await loadExternalShape(info.dynamic, 300, getShapeParticleBudget());
-        if (points) this.shapeCache[cacheKey] = points;
+        const loaded = await loadExternalShape(info.dynamic, 300, getShapeParticleBudget());
+        if (loaded && loaded.length > 0) {
+          points = loaded;
+          this.shapeCache[cacheKey] = points;
+        }
       }
     }
 
@@ -345,52 +391,22 @@ class App {
       const shapeName = conceptToShape(info.name);
       points = this.shapeCache[shapeName];
       if (!points) {
-        points = rasterizeShape(shapeName, 300, getShapeParticleBudget());
-        if (points) this.shapeCache[shapeName] = points;
+        const built = rasterizeShape(shapeName, 300, getShapeParticleBudget());
+        if (built && built.length > 0) {
+          points = built;
+          this.shapeCache[shapeName] = points;
+        }
       }
     }
 
-    return points;
+    return points || null;
   }
 
-  /**
-   * Start cycling through shapes from a batched concepts payload.
-   * Legacy path — the streaming path uses _onConceptResolved instead.
-   */
-  _startConceptCycle(shapeInfos) {
-    this._clearConceptCycle();
-    this.currentConcepts = shapeInfos;
-    this.conceptIndex = 0;
-    this._showCurrentConcept();
-
-    if (this.currentConcepts.length > 1) {
-      this.conceptTimer = setInterval(() => {
-        this.conceptIndex = (this.conceptIndex + 1) % this.currentConcepts.length;
-        this._showCurrentConcept('crossfade');
-      }, CYCLE_MS);
-    }
-  }
-
-  async _showCurrentConcept(transition = 'instant') {
+  _showCurrentConcept(transition = 'instant') {
     const info = this.currentConcepts[this.conceptIndex];
-    if (!info) return;
-
-    let points = info._points;
-    let animated = info._animated;
-    if (!points) {
-      const resolved = await this._resolvePoints(info);
-      if (!resolved) return;
-      if (resolved.isAnimated) {
-        points = resolved.points;
-        animated = { frames: resolved.frames, fps: resolved.fps };
-      } else {
-        points = resolved;
-      }
-    }
-    if (!points) return;
-
+    if (!info || !info._points) return;
     const label = info.concept || info.name;
-    this.canvas.setShape(points, label, transition, animated || null);
+    this.canvas.setShape(info._points, label, transition, info._animated || null);
   }
 
   _showThinkingTitle() {
@@ -398,7 +414,7 @@ class App {
     // it to the trailing ellipsis that seeps into the hurricane.
     const budget = Math.floor(getShapeParticleBudget() * 0.18);
     const points = rasterizeText('I\'m thinking about', {
-      font: "400 150px 'Love Light', cursive",
+      font: THINKING_FONT,
       maxPoints: Math.floor(budget * 0.80),
       alphaThreshold: 128,
       edgeOnly: true,
@@ -442,9 +458,9 @@ class App {
           // particles immediately in the release window — they all get a
           // full moment of visibility before any start streaming off.
           seepPhaseInit: Math.random() * 0.6,
-          // Left-to-right activation order: dot 0 lights up first, dot 7
-          // last — gives the "typing the ellipsis in" feel instead of all
-          // dots appearing simultaneously.
+          // Left-to-right activation order: dot 0 lights up first, the last
+          // dot last — gives the "typing the ellipsis in" feel instead of
+          // all dots appearing simultaneously.
           seepDotIndex: i,
         });
       }
@@ -465,6 +481,10 @@ class App {
     if (this.conceptTimer) {
       clearInterval(this.conceptTimer);
       this.conceptTimer = null;
+    }
+    if (this.carouselTimer) {
+      clearTimeout(this.carouselTimer);
+      this.carouselTimer = null;
     }
     this.currentConcepts = [];
     this.conceptIndex = 0;

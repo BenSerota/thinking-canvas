@@ -5,7 +5,7 @@
  *   - drift ambient (title particles held in place, free particles breeze)
  *   - form the title "Thinking Canvas" on page load
  *   - gather into a hurricane vortex while the LLM is reasoning
- *   - coalesce into one or more target shapes and ROTATE around their centroids
+ *   - coalesce into one or more target shapes and ride a carousel
  *   - dissolve back into the hurricane on a new turn
  *
  * Hurricane is continuous, not a state. Its intensity is a lerped [0,1]
@@ -13,14 +13,18 @@
  * when shapes are settled. This gives the canvas a living feel at all
  * times — the ring never blinks on/off.
  *
- * Multi-shape layout: after all shapes for a turn have streamed in,
- * they arrange side-by-side and spin slowly in place. Each shape gets
- * its own orbiting mini-hurricane of free particles.
+ * Layout is recomputed from the recorded inputs whenever the panel
+ * changes size (ResizeObserver), so shapes never keep stale pixel
+ * coordinates, and a panel that measured 0×0 at startup lays out as soon
+ * as it has a real size.
  *
- * States: title-idle → gathering → thinking → forming → settled → dissolving
+ * States: title-idle → gathering → thinking → forming → transitioning →
+ *         settled → dissolving → idle
  */
 
 const PARTICLE_COUNT = 8000;
+// The adaptive governor never trims below this many active particles.
+const MIN_ACTIVE_PARTICLES = 2000;
 const SAND_COLORS = ['#D4A574', '#C4956A', '#E8C9A0', '#B8845A', '#DEB887', '#C9A882'];
 const EDGE_COLORS = ['#F0D8B0', '#EED5A8', '#F5E0BE', '#E8D0A0'];
 const INTERIOR_COLORS = ['#A07050', '#8C6545', '#977055', '#B08060'];
@@ -41,13 +45,14 @@ const SHAPE_PARTICLE_RATIO = 0.85;
 // Hurricane intensity targets per state. Always > 0 so the ring never
 // fully disappears — it's ambient weather, not a status light.
 const HURRICANE_TARGETS = {
-  'title-idle': 0.15,  // gentle breeze, title particles locked
-  'gathering':  0.6,
-  'thinking':   1.0,   // full hurricane
-  'forming':    0.35,  // orbiting around the shape(s)
-  'settled':    0.35,  // same — shape(s) rotate, free particles orbit
-  'dissolving': 0.5,   // bit of chaos as shapes come apart
-  'idle':       0.15,
+  'title-idle':    0.15,  // gentle breeze, title particles locked
+  'gathering':     0.6,
+  'thinking':      1.0,   // full hurricane
+  'forming':       0.35,  // orbiting around the shape(s)
+  'transitioning': 0.35,  // 130 ms crossfade scatter between streamed shapes
+  'settled':       0.35,  // same — shape(s) ride the carousel, free particles orbit
+  'dissolving':    0.5,   // bit of chaos as shapes come apart
+  'idle':          0.15,
 };
 // Exponential-lerp rate per frame. ~0.04 → 25 frames to settle (~0.4s at 60fps).
 const HURRICANE_LERP = 0.04;
@@ -61,11 +66,17 @@ const CURSOR_RADIUS = 80;
 const CURSOR_REPEL_FORCE = 3.0;
 const CURSOR_ATTRACT_FORCE = 2.0;
 
+// Below this the panel hasn't been laid out yet (flex not settled, hidden
+// tab). Layout requests are recorded and replayed once it has a real size.
+const MIN_LAYOUT_SIZE = 50;
+const RELAYOUT_DEBOUNCE_MS = 150;
+const CROSSFADE_SCATTER_MS = 130;
+
 /**
  * Particle budget for shape points. Exported so shapes.js /
  * loadExternalShape can pass it as `maxPoints` and uniform-sample the
- * rasterizer output to fit. This is the upstream half of the bug-prevention
- * pair (see ./shapes.js rasterizeFromPaths comments).
+ * rasterizer output to fit. Fixed at the full particle count on purpose —
+ * the runtime clamp in _assignShapeToParticles tracks activeParticleCount.
  */
 export function getShapeParticleBudget() {
   return Math.floor(PARTICLE_COUNT * SHAPE_PARTICLE_RATIO);
@@ -76,17 +87,21 @@ export class ThinkingCanvas {
     this.canvas = canvasEl;
     this.ctx = canvasEl.getContext('2d');
     this.particles = [];
+    // Particles beyond this index are parked: not simulated, not drawn.
+    this.activeParticleCount = PARTICLE_COUNT;
     this.state = 'title-idle';
+    /** Optional callback fired on every state change: (state) => void */
+    this.onStateChange = null;
 
     /** @type {Array<{label, centerX, centerY, basePoints, particleIndices, bboxMax, isTitle, orbitRadius, orbitPhase}>} */
     this.currentShapes = [];
+    this.thinkingTitle = null;
     // Single shared angle for the multi-shape carousel. All shapes ride
     // the same virtual ring and share this angle (plus their orbitPhase).
     // Shapes stay upright — they don't spin on their own centroids, they
     // travel around the canvas center like seats on a carousel.
     this.carouselAngle = 0;
     this.transitionProgress = 0;
-    this.interimMode = false;
 
     // Hurricane intensity in [0, 1]. Drives swirl strength. Lerps toward
     // the target for the current state.
@@ -95,16 +110,33 @@ export class ThinkingCanvas {
     this.time = 0;
     this.lastTimestamp = null;
 
+    // Layout replay. `_layout` records the main content ({kind, args});
+    // the thinking title is an overlay recorded separately because it
+    // coexists with a streamed shape.
+    this._layout = null;
+    this._thinkingTitleArgs = null;
+    this._layoutSize = null;
+    this._layoutApplied = false;
+    this._replaying = false;
+    this._sizeReady = false;
+    this._crossfadeTimer = null;
+    this._relayoutTimer = null;
+
     // Cursor tracking
     this.mouseX = null;
     this.mouseY = null;
     this.mouseDown = false;
 
+    // FPS governor
+    this._frameCount = 0;
+    this._fpsCheckTime = null;
+    this._lowFpsCount = 0;
+    this._highFpsCount = 0;
+
     this._resize();
     this._initParticles();
     this._boundAnimate = this._animate.bind(this);
-    this._boundResize = this._resize.bind(this);
-    window.addEventListener('resize', this._boundResize);
+    this._observeSize();
 
     // Mouse interaction
     this.canvas.addEventListener('mousemove', (e) => {
@@ -133,23 +165,84 @@ export class ThinkingCanvas {
       this.mouseDown = false;
     });
 
-    requestAnimationFrame(this._boundAnimate);
+    // A hidden tab throttles rAF to ~1 fps; that must never read as a slow
+    // machine. Restart the measurement window whenever visibility changes.
+    this._boundVisibility = () => this._resetFpsWindow();
+    document.addEventListener('visibilitychange', this._boundVisibility);
 
-    // FPS monitoring
-    this._frameCount = 0;
-    this._fpsCheckTime = 0;
-    this._lowFpsCount = 0;
+    this._rafId = requestAnimationFrame(this._boundAnimate);
+  }
+
+  // ─── Sizing and layout replay ───
+
+  _observeSize() {
+    const onChange = () => {
+      this._resize();
+      clearTimeout(this._relayoutTimer);
+      this._relayoutTimer = setTimeout(() => this._relayoutAll(), RELAYOUT_DEBOUNCE_MS);
+    };
+    if (typeof ResizeObserver !== 'undefined') {
+      this._resizeObserver = new ResizeObserver(onChange);
+      this._resizeObserver.observe(this.canvas.parentElement);
+    } else {
+      this._boundResize = onChange;
+      window.addEventListener('resize', onChange);
+    }
   }
 
   _resize() {
     const rect = this.canvas.parentElement.getBoundingClientRect();
     this.width = rect.width;
     this.height = rect.height;
-    this.canvas.width = this.width * window.devicePixelRatio;
-    this.canvas.height = this.height * window.devicePixelRatio;
+    this._sizeReady = this.width >= MIN_LAYOUT_SIZE && this.height >= MIN_LAYOUT_SIZE;
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.max(1, Math.round(this.width * dpr));
+    this.canvas.height = Math.max(1, Math.round(this.height * dpr));
     this.canvas.style.width = this.width + 'px';
     this.canvas.style.height = this.height + 'px';
-    this.ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  /** Remember the size the current layout was computed for. */
+  _recordLayoutSize() {
+    this._layoutSize = { w: this.width, h: this.height };
+    this._layoutApplied = this._sizeReady;
+  }
+
+  /**
+   * Re-run the recorded layout against the current panel size. The thinking
+   * title (overlay) replays first because a streamed shape reserves its
+   * particles. A layout that was actually shown replays with its handwriting
+   * reveal already complete; one that was skipped at zero size plays fresh.
+   */
+  _relayoutAll() {
+    if (!this._sizeReady) return;
+    if (this._layoutSize && this._layoutSize.w === this.width && this._layoutSize.h === this.height) return;
+    const main = this._layout;
+    const titleArgs = this._thinkingTitleArgs;
+    if (!main && !titleArgs) {
+      this._recordLayoutSize();
+      return;
+    }
+    this._replaying = this._layoutApplied ? 'complete' : 'fresh';
+    try {
+      if (titleArgs) this.setThinkingTitle(titleArgs);
+      if (main) {
+        const a = main.args;
+        if (main.kind === 'title') this.setTitle(a[0], a[1]);
+        else if (main.kind === 'shape') this.setShape(a[0], a[1], 'instant', a[2]);
+        else if (main.kind === 'shapes') this.setShapes(a[0]);
+      }
+    } finally {
+      this._replaying = false;
+    }
+  }
+
+  _clearCrossfade() {
+    if (this._crossfadeTimer) {
+      clearTimeout(this._crossfadeTimer);
+      this._crossfadeTimer = null;
+    }
   }
 
   _initParticles() {
@@ -168,12 +261,16 @@ export class ThinkingCanvas {
         size: PARTICLE_SIZE + (Math.random() - 0.5) * 0.8,
         phase: Math.random() * Math.PI * 2,
         isShapeParticle: false,
-        // For multi-shape hurricane: which shape center this free particle orbits.
-        // null = orbit canvas center.
-        hurricaneCenterX: null,
-        hurricaneCenterY: null,
       });
     }
+  }
+
+  // ─── State ───
+
+  _setStateDirect(newState) {
+    if (this.state === newState) return;
+    this.state = newState;
+    if (typeof this.onStateChange === 'function') this.onStateChange(newState);
   }
 
   setState(newState) {
@@ -184,29 +281,37 @@ export class ThinkingCanvas {
     if (newState === 'thinking' && this.state !== 'gathering') {
       return;
     }
-    this.state = newState;
+    this._setStateDirect(newState);
     if (newState === 'gathering') {
-      // Release all targets so every particle (including title particles)
-      // joins the hurricane.
+      // New turn: release every particle (including title particles) into
+      // the hurricane and forget the previous layout.
+      this._clearCrossfade();
       for (const p of this.particles) {
         p.targetX = null;
         p.targetY = null;
         p.isShapeParticle = false;
         p.color = p.baseColor;
-        p.hurricaneCenterX = null;
-        p.hurricaneCenterY = null;
       }
       this.currentShapes = [];
       this.thinkingTitle = null;
+      this._thinkingTitleArgs = null;
+      this._layout = null;
     }
   }
 
+  // ─── Titles ───
+
   /**
    * Show "I'm thinking about..." as particle text above the hurricane.
-   * Displayed during thinking/carousel, cleared on Ferris wheel transition.
+   * Displayed during thinking/streaming; cleared when the carousel forms or
+   * the turn settles without shapes.
    */
   setThinkingTitle(textPoints) {
     if (!textPoints || textPoints.length === 0) return;
+    this._thinkingTitleArgs = textPoints;
+    this._layout = null;
+    this._recordLayoutSize();
+    if (!this._sizeReady) return;
 
     const aspectRatio = textPoints.aspectRatio || 6;
     const titleWidth = Math.min(this.width * 0.80, this.height * aspectRatio * 0.17);
@@ -252,6 +357,7 @@ export class ThinkingCanvas {
       orbitRadius: 0,
       orbitPhase: 0,
       basePoints,
+      hasSeep: basePoints.some(bp => bp.seep),
       particleIndices: [],
       writeReveal: {
         time: 0,
@@ -260,6 +366,7 @@ export class ThinkingCanvas {
         maxX: bpMaxX,
       },
     };
+    if (this._replaying === 'complete') shape.writeReveal.time = shape.writeReveal.duration;
 
     this._assignShapeToParticles([shape]);
     this.currentShapes = [shape];
@@ -267,13 +374,16 @@ export class ThinkingCanvas {
   }
 
   clearThinkingTitle() {
+    this._thinkingTitleArgs = null;
     if (!this.thinkingTitle) return;
     const shape = this.thinkingTitle;
     for (const pi of shape.particleIndices) {
-      this.particles[pi].targetX = null;
-      this.particles[pi].targetY = null;
-      this.particles[pi].isShapeParticle = false;
-      this.particles[pi].color = this.particles[pi].baseColor;
+      const p = this.particles[pi];
+      if (!p) continue;
+      p.targetX = null;
+      p.targetY = null;
+      p.isShapeParticle = false;
+      p.color = p.baseColor;
     }
     this.currentShapes = this.currentShapes.filter(s => s !== shape);
     this.thinkingTitle = null;
@@ -285,6 +395,15 @@ export class ThinkingCanvas {
    */
   setTitle(textPoints, label = 'Thinking Canvas') {
     if (!textPoints || textPoints.length === 0) return;
+    this._layout = { kind: 'title', args: [textPoints, label] };
+    this._thinkingTitleArgs = null;
+    this._recordLayoutSize();
+    this._setStateDirect('title-idle');
+    this.transitionProgress = 0;
+    if (!this._sizeReady) {
+      this.currentShapes = [];
+      return;
+    }
 
     const aspectRatio = textPoints.aspectRatio || 4;
     const titleWidth = Math.min(this.width * 0.82, this.height * aspectRatio * 0.22);
@@ -315,6 +434,7 @@ export class ThinkingCanvas {
       orbitRadius: 0,
       orbitPhase: 0,
       basePoints,
+      hasSeep: false,
       particleIndices: [],
       writeReveal: {
         time: 0,
@@ -323,12 +443,13 @@ export class ThinkingCanvas {
         maxX: bpMaxX,
       },
     };
+    if (this._replaying === 'complete') shape.writeReveal.time = shape.writeReveal.duration;
 
     this._assignShapeToParticles([shape]);
     this.currentShapes = [shape];
-    this.state = 'title-idle';
-    this.transitionProgress = 0;
   }
+
+  // ─── Shapes ───
 
   /**
    * Set a single shape centered on the canvas. Used during streaming
@@ -339,6 +460,10 @@ export class ThinkingCanvas {
       this.clearShape();
       return;
     }
+    this._layout = { kind: 'shape', args: [shapePoints, label, animationOpts] };
+    this._recordLayoutSize();
+    this._clearCrossfade();
+    if (!this._sizeReady) return;
 
     const doAssign = () => {
       const singleShape = this._buildShape(shapePoints, label, this.width / 2, this.height / 2, 1.0);
@@ -353,17 +478,17 @@ export class ThinkingCanvas {
         this._assignShapeToParticles([singleShape]);
         this.currentShapes = [singleShape];
       }
-      this.state = 'forming';
+      this._setStateDirect('forming');
       this.transitionProgress = 1;
     };
 
     if (transition === 'crossfade' && this.state === 'forming') {
-      this.state = 'transitioning';
+      this._setStateDirect('transitioning');
       // Collect thinking title particle indices so we don't scatter them.
       const titlePIs = this.thinkingTitle
         ? new Set(this.thinkingTitle.particleIndices)
         : null;
-      for (let i = 0; i < this.particles.length; i++) {
+      for (let i = 0; i < this.activeParticleCount; i++) {
         const p = this.particles[i];
         if (p.targetX !== null && (!titlePIs || !titlePIs.has(i))) {
           p.vx += (Math.random() - 0.5) * 4;
@@ -374,7 +499,10 @@ export class ThinkingCanvas {
           p.color = p.baseColor;
         }
       }
-      setTimeout(doAssign, 130);
+      this._crossfadeTimer = setTimeout(() => {
+        this._crossfadeTimer = null;
+        doAssign();
+      }, CROSSFADE_SCATTER_MS);
     } else {
       doAssign();
     }
@@ -384,13 +512,21 @@ export class ThinkingCanvas {
    * Arrange N shapes on a circular carousel around the canvas center and
    * rotate them all together (each shape stays upright, doesn't spin on
    * its own centroid). One hurricane ring encompasses the whole group.
-   * Used once all shapes for a turn have arrived (turn 2+).
+   * Used once all shapes for a turn have arrived.
    */
   setShapes(shapesPointsAndLabels) {
     this.thinkingTitle = null;
+    this._thinkingTitleArgs = null;
     const n = shapesPointsAndLabels.length;
     if (n === 0) return this.clearShape();
-    if (n === 1) return this.setShape(shapesPointsAndLabels[0].points, shapesPointsAndLabels[0].label);
+    if (n === 1) {
+      const only = shapesPointsAndLabels[0];
+      return this.setShape(only.points, only.label, 'instant', only.animation || null);
+    }
+    this._layout = { kind: 'shapes', args: [shapesPointsAndLabels] };
+    this._recordLayoutSize();
+    this._clearCrossfade();
+    if (!this._sizeReady) return;
 
     // Orbit radius is the distance from canvas center to each shape's
     // centroid. ~22% of min(w, h) leaves plenty of room for the shapes
@@ -433,11 +569,17 @@ export class ThinkingCanvas {
 
     this._assignShapeToParticles(shapes);
     this.currentShapes = shapes;
-    this.state = 'settled';  // skip 'forming' — multi-shape view is the settled state
+    this._setStateDirect('settled');  // skip 'forming' — multi-shape view is the settled state
     // Jump transitionProgress past the 0.5 gate so labels appear
     // immediately (no streaming fade-in for the carousel transition —
     // viewer has already seen each shape in the preceding crossfade).
     this.transitionProgress = 0.9;
+  }
+
+  /** Full-canvas scale for a shape; clamped so a tiny panel never goes negative. */
+  _fullScale() {
+    const margin = 60;
+    return Math.max(1, Math.min(this.width - margin * 2, this.height - margin * 2) * 0.7);
   }
 
   /**
@@ -446,11 +588,7 @@ export class ThinkingCanvas {
    * _assignShapeToParticles's job.
    */
   _buildShape(shapePoints, label, centerX, centerY, scaleFactor) {
-    const margin = 60;
-    const shapeW = this.width - margin * 2;
-    const shapeH = this.height - margin * 2;
-    const fullScale = Math.min(shapeW, shapeH) * 0.7;
-    const scale = fullScale * scaleFactor;
+    const scale = this._fullScale() * scaleFactor;
 
     // Find bbox of input points in [0,1] space (they're already normalized)
     let minX = 1, maxX = 0, minY = 1, maxY = 0;
@@ -479,6 +617,7 @@ export class ThinkingCanvas {
       orbitRadius: 0,     // set by setShapes for carousel; 0 = stationary
       orbitPhase: 0,
       basePoints,
+      hasSeep: false,
       particleIndices: [],
       // Animation fields (null = static shape)
       animationFrames: null,
@@ -496,11 +635,7 @@ export class ThinkingCanvas {
   _attachAnimation(shape, animOpts, centerX, centerY, scaleFactor) {
     if (!animOpts || !animOpts.frames || animOpts.frames.length < 2) return;
 
-    const margin = 60;
-    const shapeW = this.width - margin * 2;
-    const shapeH = this.height - margin * 2;
-    const fullScale = Math.min(shapeW, shapeH) * 0.7;
-    const scale = fullScale * scaleFactor;
+    const scale = this._fullScale() * scaleFactor;
 
     // Compute a global bbox across ALL frames for consistent centering
     let gMinX = 1, gMaxX = 0, gMinY = 1, gMaxY = 0;
@@ -540,14 +675,18 @@ export class ThinkingCanvas {
   /**
    * Partition the particle budget across the given shapes and assign each
    * shape a contiguous slice of particle indices. Free particles (those
-   * not claimed by any shape) get a nearest-shape home so the multi-
-   * hurricane knows where to orbit them.
+   * not claimed by any shape) go back to the hurricane, which always
+   * orbits the live canvas center.
+   *
+   * Everything derives from activeParticleCount — the budget, the index
+   * pool and the free-particle loop — so a governor downscale can never
+   * hand out more slots than there are active particles.
    *
    * Runtime contract check: verify the output Y-range covers the input
    * Y-range. If not, a downstream slicing bug has regressed.
    */
   _assignShapeToParticles(shapes, reservedIndices = null) {
-    const particleCount = this.particles.length;
+    const particleCount = this.activeParticleCount;
 
     const budget = Math.min(
       shapes.reduce((sum, s) => sum + s.basePoints.length, 0),
@@ -558,10 +697,9 @@ export class ThinkingCanvas {
       const idealShare = Math.floor(budget / shapes.length);
       return Math.min(s.basePoints.length, idealShare);
     });
-    const totalShapeSlots = perShapeBudget.reduce((a, b) => a + b, 0);
 
     // Build pool of available indices, excluding any reserved by a
-    // persistent shape (e.g. the thinking title during carousel).
+    // persistent shape (e.g. the thinking title during streaming).
     const indices = [];
     for (let i = 0; i < particleCount; i++) {
       if (reservedIndices && reservedIndices.has(i)) continue;
@@ -577,7 +715,7 @@ export class ThinkingCanvas {
     for (let s = 0; s < shapes.length; s++) {
       const shape = shapes[s];
       shape.particleIndices = [];
-      const slots = perShapeBudget[s];
+      const slots = Math.min(perShapeBudget[s], indices.length - cursor);
       for (let k = 0; k < slots; k++) {
         const pi = indices[cursor++];
         shape.particleIndices.push(pi);
@@ -588,20 +726,13 @@ export class ThinkingCanvas {
     }
 
     // Remaining particles are free — they form the single encompassing
-    // hurricane around the whole group. Home them at the canvas center so
-    // the swirl physics orbits every free particle around ONE point, not
-    // per-shape mini-hurricanes.
-    const cx = this.width / 2;
-    const cy = this.height / 2;
+    // hurricane around the whole group.
     for (; cursor < indices.length; cursor++) {
-      const pi = indices[cursor];
-      const p = this.particles[pi];
+      const p = this.particles[indices[cursor]];
       p.targetX = null;
       p.targetY = null;
       p.isShapeParticle = false;
       p.color = p.baseColor;
-      p.hurricaneCenterX = cx;
-      p.hurricaneCenterY = cy;
     }
 
     // ─── Runtime contract assert ───
@@ -622,10 +753,8 @@ export class ThinkingCanvas {
       const inRange = inMaxY - inMinY;
       if (inRange < 20) continue;  // shape too flat to meaningfully check
 
-      // Check which base-point Y values the assigned particle slots will
-      // visit. The target-set loop in _applyShapeRotation walks basePoints
-      // with a stride when slots < basePoints.length — mirror that here so
-      // the assert reflects the actual sampled indices.
+      // Mirror the stride mapping _applyShapeRotation uses so the assert
+      // reflects the actual sampled indices.
       let outMinY = Infinity, outMaxY = -Infinity;
       const slots = shape.particleIndices.length;
       const strideAssert = slots > 0 && slots < bp.length ? (bp.length / slots) : 0;
@@ -636,7 +765,7 @@ export class ThinkingCanvas {
         if (by > outMaxY) outMaxY = by;
       }
       const outRange = outMaxY - outMinY;
-      if (outRange < inRange * 0.8) {
+      if (slots > 0 && outRange < inRange * 0.8) {
         console.warn(
           `[canvas] ⚠️  Shape "${shape.label}" sampling lost coverage:\n` +
           `  input Y-range = ${inRange.toFixed(1)}px, output Y-range = ${outRange.toFixed(1)}px ` +
@@ -649,79 +778,109 @@ export class ThinkingCanvas {
     }
   }
 
-  setInterimShape(shapePoints, label) {
-    this.interimMode = true;
-    this.setShape(shapePoints, label);
-  }
-
   clearShape() {
-    this.state = 'dissolving';
+    this._clearCrossfade();
+    this._setStateDirect('dissolving');
     this.currentShapes = [];
-    this.interimMode = false;
+    this.thinkingTitle = null;
+    this._thinkingTitleArgs = null;
+    this._layout = null;
     for (const p of this.particles) {
       p.targetX = null;
       p.targetY = null;
       p.isShapeParticle = false;
       p.color = p.baseColor;
-      p.hurricaneCenterX = null;
-      p.hurricaneCenterY = null;
       p.vx += (Math.random() - 0.5) * 2;
       p.vy += (Math.random() - 0.5) * 2;
     }
     setTimeout(() => {
-      if (this.state === 'dissolving') this.state = 'idle';
+      if (this.state === 'dissolving') this._setStateDirect('idle');
     }, 2000);
   }
 
-  setThinking(isThinking) {
-    // Kept for backward compat with app.js. Maps to states that drive
-    // hurricaneIntensity through HURRICANE_TARGETS.
-    if (isThinking && this.state !== 'forming' && this.state !== 'settled') {
-      this.state = 'thinking';
-    } else if (!isThinking && this.state === 'thinking') {
-      this.state = 'idle';
-    }
-  }
+  // ─── Frame loop ───
 
   _animate(timestamp) {
+    this._rafId = requestAnimationFrame(this._boundAnimate);
+
     if (this.lastTimestamp !== null) {
       const dt = Math.min((timestamp - this.lastTimestamp) / 1000, 0.05);
       this.time += dt;
     }
     this.lastTimestamp = timestamp;
 
-    // FPS monitoring
-    this._frameCount++;
-    if (timestamp - this._fpsCheckTime > 2000) {
-      const fps = (this._frameCount / ((timestamp - this._fpsCheckTime) / 1000));
-      if (fps < 24) {
-        this._lowFpsCount++;
-        if (this._lowFpsCount >= 3) {
-          const reduction = Math.floor(this.particles.length * 0.15);
-          this.particles.splice(this.particles.length - reduction, reduction);
-          // Drop any particleIndices that now point past the end — otherwise
-          // _applyShapeRotation reads this.particles[pi] and crashes on undefined.
-          const newLen = this.particles.length;
-          for (const shape of this.currentShapes) {
-            if (shape.particleIndices) {
-              shape.particleIndices = shape.particleIndices.filter(pi => pi < newLen);
-            }
-          }
-          if (this.thinkingTitle && this.thinkingTitle.particleIndices) {
-            this.thinkingTitle.particleIndices = this.thinkingTitle.particleIndices.filter(pi => pi < newLen);
-          }
-          this._lowFpsCount = 0;
-        }
-      } else {
-        this._lowFpsCount = 0;
-      }
-      this._frameCount = 0;
-      this._fpsCheckTime = timestamp;
-    }
-
+    this._sampleFps(timestamp);
     this._update();
     this._render();
-    requestAnimationFrame(this._boundAnimate);
+  }
+
+  /**
+   * Adaptive particle count. Sustained < 24 fps trims the active count by
+   * 15 %; sustained > 50 fps grows it back by 10 % up to PARTICLE_COUNT.
+   * Nothing is ever destroyed, and frames from a hidden tab are ignored
+   * (rAF throttles there — it says nothing about the machine).
+   */
+  _sampleFps(timestamp) {
+    if (document.visibilityState !== 'visible') {
+      this._resetFpsWindow();
+      return;
+    }
+    if (this._fpsCheckTime === null) {
+      this._fpsCheckTime = timestamp;
+      this._frameCount = 0;
+      return;
+    }
+    this._frameCount++;
+    const elapsed = timestamp - this._fpsCheckTime;
+    if (elapsed < 2000) return;
+
+    const fps = this._frameCount / (elapsed / 1000);
+    if (fps < 24) {
+      this._lowFpsCount++;
+      this._highFpsCount = 0;
+      if (this._lowFpsCount >= 3) {
+        this._setActiveParticleCount(Math.floor(this.activeParticleCount * 0.85));
+        this._lowFpsCount = 0;
+      }
+    } else if (fps > 50 && this.activeParticleCount < PARTICLE_COUNT) {
+      this._highFpsCount++;
+      this._lowFpsCount = 0;
+      if (this._highFpsCount >= 3) {
+        this._setActiveParticleCount(Math.ceil(this.activeParticleCount * 1.1));
+        this._highFpsCount = 0;
+      }
+    } else {
+      this._lowFpsCount = 0;
+      this._highFpsCount = 0;
+    }
+    this._frameCount = 0;
+    this._fpsCheckTime = timestamp;
+  }
+
+  _resetFpsWindow() {
+    this._frameCount = 0;
+    this._fpsCheckTime = null;
+    this._lowFpsCount = 0;
+    this._highFpsCount = 0;
+  }
+
+  _setActiveParticleCount(count) {
+    const next = Math.max(MIN_ACTIVE_PARTICLES, Math.min(PARTICLE_COUNT, count));
+    if (next === this.activeParticleCount) return;
+    console.log(`[canvas] active particles ${this.activeParticleCount} → ${next}`);
+    this.activeParticleCount = next;
+    for (let i = next; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      p.targetX = null;
+      p.targetY = null;
+      p.isShapeParticle = false;
+      p.color = p.baseColor;
+    }
+    // Re-slice every shape (the thinking title included — it lives in
+    // currentShapes) across the new active range. No reservations: reserved
+    // indices never reach the free-particle cleanup and would linger as a
+    // frozen ghost of the old title.
+    if (this.currentShapes.length > 0) this._assignShapeToParticles(this.currentShapes);
   }
 
   _update() {
@@ -737,19 +896,21 @@ export class ThinkingCanvas {
 
     const cx = this.width / 2;
     const cy = this.height / 2;
-    const springK = this.interimMode ? SPRING_K * 0.6 : SPRING_K;
-    const springDamp = this.interimMode ? 0.92 : SPRING_DAMPING;
+    const springK = SPRING_K;
+    const springDamp = SPRING_DAMPING;
     const intensity = this.hurricaneIntensity;
 
     // Target hurricane radius. The ring must ENCOMPASS whatever shapes
-    // are on screen — it should never overlap or cut through them.
+    // are on screen — it should never overlap or cut through them. The
+    // thinking title is an overlay and doesn't count as a shape here.
     let baseRadius = 120;
-    if ((this.state === 'forming' || this.state === 'settled') && this.currentShapes.length > 0) {
-      if (this.currentShapes.length === 1 && !this.currentShapes[0].isTitle) {
+    if (this.state === 'forming' || this.state === 'settled' || this.state === 'transitioning') {
+      const shapes = this.currentShapes.filter(s => !s.isTitle);
+      if (shapes.length === 1) {
         // Single shape: push the ring outside the shape's bounding box
-        baseRadius = this.currentShapes[0].bboxMax * 0.6 + 50;
-      } else if (this.currentShapes.length > 1) {
-        const firstOrbiting = this.currentShapes.find(s => s.orbitRadius > 0);
+        baseRadius = shapes[0].bboxMax * 0.6 + 50;
+      } else if (shapes.length > 1) {
+        const firstOrbiting = shapes.find(s => s.orbitRadius > 0);
         if (firstOrbiting) {
           baseRadius = firstOrbiting.orbitRadius + firstOrbiting.bboxMax * 0.8;
         }
@@ -757,7 +918,8 @@ export class ThinkingCanvas {
     }
     const targetRadius = baseRadius + Math.sin(this.time * 1.5) * 30;
 
-    for (const p of this.particles) {
+    for (let i = 0; i < this.activeParticleCount; i++) {
+      const p = this.particles[i];
       // Subtle ambient brownian
       p.vx += (Math.random() - 0.5) * BROWNIAN * 0.2;
       p.vy += (Math.random() - 0.5) * BROWNIAN * 0.2;
@@ -795,10 +957,8 @@ export class ThinkingCanvas {
         // intensity scales the force strength so we get everything from
         // gentle breeze (intensity 0.15) to full vortex (intensity 1.0)
         // with the same physics.
-        const homeX = p.hurricaneCenterX != null ? p.hurricaneCenterX : cx;
-        const homeY = p.hurricaneCenterY != null ? p.hurricaneCenterY : cy;
-        const dx = p.x - homeX;
-        const dy = p.y - homeY;
+        const dx = p.x - cx;
+        const dy = p.y - cy;
         const dist = Math.sqrt(dx * dx + dy * dy);
         const angle = Math.atan2(dy, dx);
 
@@ -819,11 +979,9 @@ export class ThinkingCanvas {
         // Extra gathering pull during gather state (distinct behavior
         // from the swirl — particles rush in before organizing).
         if (this.state === 'gathering') {
-          const gx = p.x - cx;
-          const gy = p.y - cy;
           const pulse = 1 + Math.sin(this.time * 3) * 0.3;
-          p.vx -= gx * GATHER_PULL * pulse;
-          p.vy -= gy * GATHER_PULL * pulse;
+          p.vx -= dx * GATHER_PULL * pulse;
+          p.vy -= dy * GATHER_PULL * pulse;
         }
 
         // Light brownian so the swirl stays coherent at high intensity.
@@ -868,7 +1026,7 @@ export class ThinkingCanvas {
       this.carouselAngle += SHAPE_ROTATION_SPEED;
     }
 
-    // During the 200ms crossfade scatter window, do NOT write targets.
+    // During the crossfade scatter window, do NOT write targets.
     // setShape kicked all particles with a small velocity impulse so they
     // scatter; if we keep overwriting targetX/Y to the old shape's
     // basePoints here, the spring drags them straight back and the old
@@ -879,23 +1037,9 @@ export class ThinkingCanvas {
     const canvasCy = this.height / 2;
 
     for (const shape of this.currentShapes) {
-      if (shape.isTitle && !shape.writeReveal) {
-        // Static title (page-load "Thinking Canvas"): targets set once.
-        if (shape.particleIndices.length && this.particles[shape.particleIndices[0]].targetX == null) {
-          for (let k = 0; k < shape.particleIndices.length; k++) {
-            const pi = shape.particleIndices[k];
-            const bp = shape.basePoints[k % shape.basePoints.length];
-            this.particles[pi].targetX = bp.x + (Math.random() - 0.5) * 2;
-            this.particles[pi].targetY = bp.y + (Math.random() - 0.5) * 2;
-            const palette = bp.edge ? EDGE_COLORS : INTERIOR_COLORS;
-            this.particles[pi].color = palette[Math.floor(Math.random() * palette.length)];
-          }
-        }
-        continue;
-      }
       // Non-title shapes: orbit movement + animation frame cycling.
-      // Animated titles (writeReveal) skip this block but share the
-      // writeReveal + target-setting code below.
+      // Titles skip this block but share the writeReveal + target-setting
+      // code below.
       if (!shape.isTitle) {
         let newCx = shape.centerX;
         let newCy = shape.centerY;
@@ -953,83 +1097,22 @@ export class ThinkingCanvas {
       //   (0.85 - 1.0] released               → particle dissipates into
       //                                          the hurricane starting
       //                                          from the dot's position
-      //                                          (nearest hurricane point,
-      //                                          not a far-away drift)
       //   wrap                               → particle is teleported
-      //                                          back to the dot (no
-      //                                          visible journey from the
-      //                                          hurricane back)
+      //                                          back to the dot
       // Gate: the animation only runs once writeReveal has finished, so
-      // the ellipsis only appears after the rest of the phrase.
-      const hasSeep = shape.writeReveal && shape.basePoints.some(bp => bp.seep);
-      if (hasSeep) {
-        const wr = shape.writeReveal;
-        const cycleSec = 5.0;
-        const DOT_STAGGER = 0.28;  // seconds between sequential dot activations
-        const nowSec = performance.now() / 1000;
-        // Time elapsed since the main phrase finished writing. Each dot
-        // activates once postRevealSec passes its seepDotIndex * stagger,
-        // creating a left-to-right "typing" of the ellipsis.
-        const postRevealSec = wr.time - wr.duration;
-        for (let k = 0; k < shape.basePoints.length; k++) {
-          const bp = shape.basePoints[k];
-          if (!bp.seep) continue;
-          const activationAt = (bp.seepDotIndex || 0) * DOT_STAGGER;
-          if (postRevealSec < activationAt) {
-            bp._seepPhase = -1;
-            continue;
-          }
-          const phase = (nowSec / cycleSec + bp.seepPhaseInit) % 1;
-          const prev = bp._seepPhase;
-          const pi = shape.particleIndices[k % shape.particleIndices.length];
-          const p = this.particles[pi];
-          // (a) First activation: the particle was in the hurricane; snap
-          //     it home so the dot materializes cleanly at its position.
-          // (b) Cycle wrap: respawn at home after a released particle
-          //     completes a full lap in the hurricane.
-          // (c) Release transition (phase just crossed 0.85): give a
-          //     tangential velocity kick so the particle streams into the
-          //     hurricane on a curved path rather than falling straight
-          //     down under the radial pull of the swirl.
-          if (p) {
-            if (prev === undefined || prev < 0) {
-              p.x = bp.seepHomeX;
-              p.y = bp.seepHomeY;
-              p.vx = 0;
-              p.vy = 0;
-            } else if (prev > 0.5 && phase < prev - 0.3) {
-              p.x = bp.seepHomeX;
-              p.y = bp.seepHomeY;
-              p.vx = 0;
-              p.vy = 0;
-            } else if (prev <= 0.85 && phase > 0.85) {
-              // Tangential kick around the canvas-center hurricane: take
-              // the perpendicular to the vector from hurricane center to
-              // the particle, then push it along that tangent so it swirls
-              // into the vortex instead of plummeting to center.
-              const cx = this.width / 2;
-              const cy = this.height / 2;
-              const rx = p.x - cx;
-              const ry = p.y - cy;
-              const rLen = Math.sqrt(rx * rx + ry * ry) || 1;
-              const tx = -ry / rLen;
-              const ty = rx / rLen;
-              const kick = 2.4;
-              p.vx += tx * kick + 0.6;  // + slight outward bias (rightward)
-              p.vy += ty * kick;
-            }
-          }
-          bp._seepPhase = phase;
-        }
-      }
+      // the ellipsis only appears after the rest of the phrase. Dots
+      // activate left-to-right, DOT_STAGGER seconds apart.
+      const SEEP_CYCLE_SEC = 5.0;
+      const DOT_STAGGER = 0.28;
+      const seepNow = performance.now() / 1000;
+      const postRevealSec = shape.hasSeep ? shape.writeReveal.time - shape.writeReveal.duration : 0;
 
       // Write targets: each particle tracks its assigned basePoint.
       // When we have fewer slots than basePoints (carousel divides the
-      // budget across N shapes), stride through basePoints so coverage is
-      // uniform. Without this, animated Lottie shapes (which store static
-      // points first, dynamic after) would only assign particles to the
-      // static nucleus — the dynamic/animated portion would be invisible
-      // (e.g. DNA helix losing its rungs, leaving just the two rails).
+      // budget across N shapes, or the governor trimmed the active count),
+      // stride through basePoints so coverage is uniform. Without this,
+      // animated Lottie shapes (which store static points first, dynamic
+      // after) would only assign particles to the static nucleus.
       const bpLen = shape.basePoints.length;
       const pLen = shape.particleIndices.length;
       const useStride = pLen > 0 && pLen < bpLen;
@@ -1038,31 +1121,63 @@ export class ThinkingCanvas {
         const pi = shape.particleIndices[k];
         const bpIdx = useStride ? Math.floor(k * stride) : (k % bpLen);
         const bp = shape.basePoints[bpIdx];
+        const p = this.particles[pi];
 
-        // Seep particles: pre-reveal they sit in the hurricane (phase = -1);
-        // mid-cycle they're tethered at the static dot; near end-of-cycle
-        // they release to dissipate into the hurricane at the dot's
-        // position. The teleport above handles respawn at wrap.
         if (bp.seep) {
+          // The seep cycle is evaluated for the particle that actually
+          // tracks this dot — the same mapping as the target write below.
+          const activationAt = (bp.seepDotIndex || 0) * DOT_STAGGER;
+          if (postRevealSec < activationAt) {
+            bp._seepPhase = -1;
+          } else {
+            const phase = (seepNow / SEEP_CYCLE_SEC + bp.seepPhaseInit) % 1;
+            const prev = bp._seepPhase;
+            if (prev === undefined || prev < 0) {
+              // First activation: snap home so the dot materializes cleanly.
+              p.x = bp.seepHomeX;
+              p.y = bp.seepHomeY;
+              p.vx = 0;
+              p.vy = 0;
+            } else if (prev > 0.5 && phase < prev - 0.3) {
+              // Cycle wrap: respawn at home after a lap in the hurricane.
+              p.x = bp.seepHomeX;
+              p.y = bp.seepHomeY;
+              p.vx = 0;
+              p.vy = 0;
+            } else if (prev <= 0.85 && phase > 0.85) {
+              // Release: tangential kick around the canvas-center hurricane
+              // so the particle swirls into the vortex instead of
+              // plummeting to center.
+              const rx = p.x - canvasCx;
+              const ry = p.y - canvasCy;
+              const rLen = Math.sqrt(rx * rx + ry * ry) || 1;
+              const tx = -ry / rLen;
+              const ty = rx / rLen;
+              const kick = 2.4;
+              p.vx += tx * kick + 0.6;  // + slight outward bias (rightward)
+              p.vy += ty * kick;
+            }
+            bp._seepPhase = phase;
+          }
           if (bp._seepPhase === undefined || bp._seepPhase < 0 || bp._seepPhase > 0.85) {
-            this.particles[pi].targetX = null;
-            this.particles[pi].targetY = null;
+            p.targetX = null;
+            p.targetY = null;
             continue;
           }
         } else if (bp.x > revealX) {
-          this.particles[pi].targetX = null;
-          this.particles[pi].targetY = null;
+          p.targetX = null;
+          p.targetY = null;
           continue;
         }
 
-        if (this.particles[pi].targetX == null) {
-          this.particles[pi].targetX = bp.x + (Math.random() - 0.5) * 3;
-          this.particles[pi].targetY = bp.y + (Math.random() - 0.5) * 3;
+        if (p.targetX == null) {
+          p.targetX = bp.x + (Math.random() - 0.5) * 3;
+          p.targetY = bp.y + (Math.random() - 0.5) * 3;
           const palette = bp.edge ? EDGE_COLORS : INTERIOR_COLORS;
-          this.particles[pi].color = palette[Math.floor(Math.random() * palette.length)];
+          p.color = palette[Math.floor(Math.random() * palette.length)];
         } else {
-          this.particles[pi].targetX = bp.x;
-          this.particles[pi].targetY = bp.y;
+          p.targetX = bp.x;
+          p.targetY = bp.y;
         }
       }
     }
@@ -1077,7 +1192,8 @@ export class ThinkingCanvas {
     ctx.fillRect(0, 0, this.width, this.height);
     ctx.globalAlpha = 1;
 
-    for (const p of this.particles) {
+    for (let i = 0; i < this.activeParticleCount; i++) {
+      const p = this.particles[i];
       ctx.fillStyle = p.color;
 
       if (p.targetX !== null && p.isShapeParticle) {
@@ -1087,12 +1203,12 @@ export class ThinkingCanvas {
 
         if (dist < 5) {
           // Glow
-          ctx.globalAlpha = this.interimMode ? 0.1 : 0.15;
+          ctx.globalAlpha = 0.15;
           ctx.beginPath();
           ctx.arc(Math.round(p.x), Math.round(p.y), GLOW_SIZE, 0, Math.PI * 2);
           ctx.fill();
           // Main
-          ctx.globalAlpha = this.interimMode ? 0.6 : 0.9;
+          ctx.globalAlpha = 0.9;
           ctx.beginPath();
           ctx.arc(Math.round(p.x), Math.round(p.y), p.size * 0.8, 0, Math.PI * 2);
           ctx.fill();
@@ -1110,30 +1226,32 @@ export class ThinkingCanvas {
 
     ctx.globalAlpha = 1;
 
-    // Per-shape labels. Skip title (its text IS the particles) and skip
-    // early-forming shapes until they've settled visually (crossfade look).
-    if ((this.state === 'forming' || this.state === 'settled') && this.currentShapes.length > 0) {
-      this.transitionProgress = Math.min(1, this.transitionProgress + 0.008);
-      if (this.transitionProgress > 0.5) {
-        const alpha = (this.transitionProgress - 0.5) * 0.3;
-        ctx.fillStyle = `rgba(200, 180, 160, ${this.interimMode ? alpha * 0.5 : alpha})`;
-        ctx.font = '14px monospace';
-        ctx.textAlign = 'center';
+    // Per-shape labels. The thinking title is not a shape (its text IS the
+    // particles); early-forming shapes wait until they've settled visually.
+    if (this.state === 'forming' || this.state === 'settled') {
+      const shapes = this.currentShapes.filter(s => !s.isTitle);
+      if (shapes.length > 0) {
+        this.transitionProgress = Math.min(1, this.transitionProgress + 0.008);
+        if (this.transitionProgress > 0.5) {
+          const alpha = (this.transitionProgress - 0.5) * 0.3;
+          ctx.fillStyle = `rgba(200, 180, 160, ${alpha})`;
+          ctx.font = '14px monospace';
+          ctx.textAlign = 'center';
 
-        if (this.currentShapes.length === 1 && !this.currentShapes[0].isTitle) {
-          // Single shape: label at the bottom of canvas.
-          ctx.fillText(this.currentShapes[0].label, this.width / 2, this.height - 30);
-        } else if (this.currentShapes.length > 1) {
-          // Multi-shape carousel: label under each shape's centroid.
-          // centerX/centerY update every frame in _applyShapeRotation, so
-          // the label travels with the shape around the orbit.
-          for (const shape of this.currentShapes) {
-            if (shape.isTitle) continue;
-            const labelY = Math.min(
-              shape.centerY + shape.bboxMax / 2 + 20,
-              this.height - 12
-            );
-            ctx.fillText(shape.label, shape.centerX, labelY);
+          if (shapes.length === 1) {
+            // Single shape: label at the bottom of canvas.
+            ctx.fillText(shapes[0].label, this.width / 2, this.height - 30);
+          } else {
+            // Multi-shape carousel: label under each shape's centroid.
+            // centerX/centerY update every frame in _applyShapeRotation, so
+            // the label travels with the shape around the orbit.
+            for (const shape of shapes) {
+              const labelY = Math.min(
+                shape.centerY + shape.bboxMax / 2 + 20,
+                this.height - 12
+              );
+              ctx.fillText(shape.label, shape.centerX, labelY);
+            }
           }
         }
       }
@@ -1141,6 +1259,11 @@ export class ThinkingCanvas {
   }
 
   destroy() {
-    window.removeEventListener('resize', this._boundResize);
+    if (this._rafId) cancelAnimationFrame(this._rafId);
+    if (this._resizeObserver) this._resizeObserver.disconnect();
+    if (this._boundResize) window.removeEventListener('resize', this._boundResize);
+    document.removeEventListener('visibilitychange', this._boundVisibility);
+    clearTimeout(this._relayoutTimer);
+    this._clearCrossfade();
   }
 }
