@@ -50,6 +50,13 @@ class App {
     this.carouselTimer = null;
     // Monotonic turn id — see the file header.
     this.turnId = 0;
+    this.inFlight = false;
+
+    // State readout in the canvas corner. On the idle title it doubles as
+    // the hint for the cursor interaction.
+    this.stateEl = document.getElementById('stateIndicator');
+    this.canvas.onStateChange = (state) => this._renderState(state);
+    this._renderState(this.canvas.state);
 
     this._init();
 
@@ -105,7 +112,32 @@ class App {
     }
   }
 
+  _renderState(state) {
+    if (!this.stateEl) return;
+    const labels = {
+      'title-idle': 'move your cursor through the sand',
+      'gathering': 'gathering…',
+      'thinking': 'thinking…',
+    };
+    this.stateEl.textContent = labels[state] || '';
+  }
+
+  /**
+   * History to send with `text`: everything the user and assistant said,
+   * minus the trailing user entry when it is the message being sent (so a
+   * retry doesn't duplicate it), capped to what the server reads.
+   */
+  _historyFor(text) {
+    const all = this.chat.getHistory();
+    let last = all.length - 1;
+    while (last >= 0 && all[last].role !== 'user') last--;
+    const base = last >= 0 && all[last].content === text ? all.slice(0, last) : all;
+    return base.slice(-10);
+  }
+
   async handleUserMessage(text) {
+    if (this.inFlight) return;
+    this.inFlight = true;
     this.turnId++;
     this.chat.setInputEnabled(false);
 
@@ -127,9 +159,7 @@ class App {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
-          // The server only uses the last 10 turns and rejects more than 50
-          // entries — never send more than it will read.
-          history: this.chat.getHistory().slice(0, -1).slice(-10),
+          history: this._historyFor(text),
         }),
       });
       if (!response.ok) {
@@ -191,7 +221,10 @@ class App {
               break;
 
             case 'error':
-              this.chat.addMessage('assistant', data.message || 'Something went wrong. Please try again.');
+              this.chat.addErrorMessage(
+                data.message || 'Something went wrong.',
+                () => this.handleUserMessage(text)
+              );
               break;
 
             case 'done':
@@ -202,7 +235,7 @@ class App {
     } catch (error) {
       console.error('Chat error:', error);
       this._settleEmptyTurn();
-      this.chat.addMessage('assistant', 'Sorry, something went wrong. Please try again.');
+      this.chat.addErrorMessage("Couldn't reach the server.", () => this.handleUserMessage(text));
     } finally {
       // Whatever happened, the reply bubble must stop blinking and land in
       // the history, and the connection must not linger.
@@ -212,6 +245,7 @@ class App {
     }
 
     if (this.turnShapes.length === 0) this._settleEmptyTurn();
+    this.inFlight = false;
     this.chat.setInputEnabled(true);
   }
 

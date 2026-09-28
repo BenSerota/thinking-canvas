@@ -7,6 +7,9 @@ export class ChatPanel {
     this.container = containerEl;
     this.onSend = onSend;
     this.messages = [];
+    // True while a turn is in flight: composing stays possible, sending
+    // does not.
+    this.busy = false;
 
     this._buildUI();
   }
@@ -17,8 +20,9 @@ export class ChatPanel {
         <div class="chat-title">Thinking Canvas</div>
         <div class="chat-subtitle">AI with visual thinking</div>
       </div>
-      <div class="chat-messages" id="chatMessages"></div>
+      <div class="chat-messages" id="chatMessages" role="log" aria-live="polite"></div>
       <div class="chat-input-area">
+        <label for="chatInput" class="sr-only">Message</label>
         <textarea id="chatInput" placeholder="Type a message..." rows="1"></textarea>
         <button id="chatSend" aria-label="Send">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -34,7 +38,8 @@ export class ChatPanel {
 
     this.sendBtn.addEventListener('click', () => this._handleSend());
     this.inputEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
+      // keyCode 229 = IME composition in progress (older browsers).
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
         e.preventDefault();
         this._handleSend();
       }
@@ -48,6 +53,7 @@ export class ChatPanel {
   }
 
   _handleSend() {
+    if (this.busy) return;
     const text = this.inputEl.value.trim();
     if (!text) return;
 
@@ -142,13 +148,50 @@ export class ChatPanel {
     };
   }
 
+  /**
+   * Render a failed turn: a distinct bubble with a Retry button. Error
+   * bubbles never enter the history. `onRetry` fires at most once.
+   */
+  addErrorMessage(text, onRetry) {
+    const msgEl = document.createElement('div');
+    msgEl.className = 'chat-message chat-message-assistant';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble chat-error';
+    bubble.setAttribute('role', 'alert');
+
+    const label = document.createElement('span');
+    label.textContent = text;
+    bubble.appendChild(label);
+
+    if (typeof onRetry === 'function') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chat-retry';
+      btn.textContent = 'Retry';
+      btn.addEventListener('click', () => {
+        btn.disabled = true;
+        onRetry();
+      });
+      bubble.appendChild(btn);
+    }
+
+    msgEl.appendChild(bubble);
+    this.messagesEl.appendChild(msgEl);
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+    return bubble;
+  }
+
+  /** The textarea stays usable during a turn; only sending is gated. */
   setInputEnabled(enabled) {
-    this.inputEl.disabled = !enabled;
+    this.busy = !enabled;
     this.sendBtn.disabled = !enabled;
     if (enabled) this.inputEl.focus();
   }
 
   getHistory() {
-    return this.messages.map(m => ({ role: m.role, content: m.text }));
+    return this.messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: m.text }));
   }
 }

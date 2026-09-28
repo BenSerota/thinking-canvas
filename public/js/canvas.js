@@ -68,6 +68,11 @@ const TRAIL_CLEAR = 0.35;
 const SPRITE_SIZE = 32;
 const SPRITE_DISC_RADIUS = SPRITE_SIZE / 2 - 1;
 
+// Honour the OS reduced-motion preference: the canvas still forms shapes,
+// but the perpetual swirl and the carousel slow right down.
+const REDUCED_MOTION = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION_SCALE = REDUCED_MOTION ? 0.3 : 1;
+
 // Cursor interaction constants
 const CURSOR_RADIUS = 80;
 const CURSOR_REPEL_FORCE = 3.0;
@@ -180,6 +185,12 @@ export class ThinkingCanvas {
       this.mouseX = touch.clientX - rect.left;
       this.mouseY = touch.clientY - rect.top;
     });
+    this.canvas.addEventListener('touchstart', (e) => {
+      const rect = this.canvas.getBoundingClientRect();
+      const touch = e.touches[0];
+      this.mouseX = touch.clientX - rect.left;
+      this.mouseY = touch.clientY - rect.top;
+    }, { passive: true });
     this.canvas.addEventListener('touchend', () => {
       this.mouseX = null;
       this.mouseY = null;
@@ -1007,7 +1018,7 @@ export class ThinkingCanvas {
 
         // Tangential force — inner particles orbit faster (hurricane eye)
         const speedMult = dist < 60 ? 2.0 : (dist < 150 ? 1.5 : 1.0);
-        const swirlStrength = SWIRL_SPEED * intensity * speedMult * dtF;
+        const swirlStrength = SWIRL_SPEED * intensity * speedMult * dtF * MOTION_SCALE;
         const modulation = 1 + Math.sin(this.time * 3 + p.phase) * 0.5;
         p.vx += Math.cos(angle + Math.PI / 2) * swirlStrength * modulation;
         p.vy += Math.sin(angle + Math.PI / 2) * swirlStrength * modulation;
@@ -1066,7 +1077,7 @@ export class ThinkingCanvas {
     // stays put.
     const inCarousel = this.state === 'settled' && this.currentShapes.length > 1;
     if (inCarousel) {
-      this.carouselAngle += SHAPE_ROTATION_SPEED * this._dtF;
+      this.carouselAngle += SHAPE_ROTATION_SPEED * this._dtF * MOTION_SCALE;
     }
 
     // During the crossfade scatter window, do NOT write targets.
@@ -1289,7 +1300,9 @@ export class ThinkingCanvas {
       if (shapes.length > 0) {
         this.transitionProgress = Math.min(1, this.transitionProgress + 0.008 * this._dtF);
         if (this.transitionProgress > 0.5) {
-          const alpha = (this.transitionProgress - 0.5) * 0.3;
+          // Fades in over the second half of the transition, to 0.65 —
+          // legible (≈4.6:1 on the background) but still quiet.
+          const alpha = Math.min(0.65, (this.transitionProgress - 0.5) * 1.3);
           ctx.fillStyle = `rgba(200, 180, 160, ${alpha})`;
           ctx.font = '14px monospace';
           ctx.textAlign = 'center';
