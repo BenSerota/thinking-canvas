@@ -3,11 +3,16 @@
  * build-embeddings.js
  *
  * Reads public/shapes/library-manifest.json, computes a 384-dim MiniLM
- * embedding for each icon's displayName, writes the full matrix to
- * data/library-embeddings.json (~15 MB for ~5,500 icons).
+ * embedding for each icon's display name (see embedText for why the search
+ * terms are deliberately not folded in), and writes:
+ *   data/library-embeddings.index.json  — names + checksum (tiny)
+ *   data/library-embeddings.f32         — raw Float32 matrix (zero-parse)
+ *   data/library-embeddings.json        — same data as JSON (fallback)
  *
- * Idempotent: if the output file already exists AND its manifest checksum
- * matches the current manifest, skips the rebuild.
+ * The binaries are written first, each to a temp file renamed into place,
+ * and the JSON last — a crash can never leave a fresh JSON next to a stale
+ * matrix. Idempotent: skips when the index's checksum and count match the
+ * current manifest and the matrix has the expected size.
  */
 
 const fs = require('fs');
@@ -16,13 +21,48 @@ const crypto = require('crypto');
 
 const ROOT = path.resolve(__dirname, '..');
 const MANIFEST_PATH = path.join(ROOT, 'public', 'shapes', 'library-manifest.json');
-const OUT_PATH = path.join(ROOT, 'data', 'library-embeddings.json');
+const DATA_DIR = path.join(ROOT, 'data');
+const OUT_PATH = path.join(DATA_DIR, 'library-embeddings.json');
+const INDEX_PATH = path.join(DATA_DIR, 'library-embeddings.index.json');
+const VECTORS_PATH = path.join(DATA_DIR, 'library-embeddings.f32');
 const BATCH_SIZE = 32;
 
 const embeddingService = require('../services/embedding-service');
+const EMBED_DIM = embeddingService.EMBED_DIM;
 
 function sha256(str) {
   return crypto.createHash('sha256').update(str).digest('hex');
+}
+
+/** Write via a temp file + rename so readers never see a partial file. */
+function writeAtomic(filePath, data) {
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, filePath);
+}
+
+/**
+ * The embedded text is the display name only. Measured 2026-09-28: folding
+ * the Font Awesome search terms into the same string dilutes direct matches
+ * (query "wizard hat" vs hat-wizard: 0.93 name-only → 0.56 with all terms,
+ * 0.66 with six). The terms are still used at runtime by icon-matcher's
+ * noun-overlap gate. Follow-up: embed the terms as a second vector per icon
+ * and score max(name, terms).
+ */
+function embedText(icon) {
+  return icon.displayName;
+}
+
+function isUpToDate(manifest, manifestChecksum) {
+  try {
+    if (!fs.existsSync(INDEX_PATH) || !fs.existsSync(VECTORS_PATH) || !fs.existsSync(OUT_PATH)) return false;
+    const index = JSON.parse(fs.readFileSync(INDEX_PATH, 'utf-8'));
+    if (index.manifestChecksum !== manifestChecksum) return false;
+    if (index.count !== manifest.icons.length || index.dim !== EMBED_DIM) return false;
+    return fs.statSync(VECTORS_PATH).size === index.count * index.dim * 4;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function main() {
@@ -35,45 +75,35 @@ async function main() {
   const manifest = JSON.parse(manifestText);
   const manifestChecksum = sha256(manifestText);
 
-  // Skip if already built with same checksum AND binary files exist
-  const BIN_INDEX = path.join(ROOT, 'data', 'library-embeddings.index.json');
-  const BIN_VECTORS = path.join(ROOT, 'data', 'library-embeddings.f32');
-  if (fs.existsSync(OUT_PATH)) {
-    try {
-      const existing = JSON.parse(fs.readFileSync(OUT_PATH, 'utf-8'));
-      if (existing.manifestChecksum === manifestChecksum
-          && fs.existsSync(BIN_INDEX) && fs.existsSync(BIN_VECTORS)) {
-        console.log('[build-embeddings] up to date — nothing to do.');
-        return;
-      }
-      if (existing.manifestChecksum === manifestChecksum) {
-        console.log('[build-embeddings] binary files missing — regenerating...');
-      } else {
-        console.log('[build-embeddings] manifest changed — rebuilding...');
-      }
-    } catch (_) {
-      // malformed — fall through to rebuild
-    }
+  if (isUpToDate(manifest, manifestChecksum)) {
+    console.log('[build-embeddings] up to date — nothing to do.');
+    return;
   }
 
   console.log(`[build-embeddings] embedding ${manifest.icons.length} icons via ${embeddingService.MODEL_NAME}...`);
   console.log('[build-embeddings] first run will download the model (~30 MB)...');
 
+  const names = [];
+  const vectorBuf = Buffer.alloc(manifest.icons.length * EMBED_DIM * 4);
   const entries = [];
   let done = 0;
   const startTime = Date.now();
 
   for (let i = 0; i < manifest.icons.length; i += BATCH_SIZE) {
     const batch = manifest.icons.slice(i, i + BATCH_SIZE);
-    const texts = batch.map(ic => ic.displayName);
-
-    const vectors = await embeddingService.embedBatch(texts);
+    const vectors = await embeddingService.embedBatch(batch.map(embedText));
 
     for (let j = 0; j < batch.length; j++) {
-      entries.push({
-        name: batch[j].name,
-        embedding: Array.from(vectors[j]), // Float32Array → plain array for JSON
-      });
+      const vec = vectors[j];
+      if (!vec || vec.length !== EMBED_DIM) {
+        throw new Error(`embedding for "${batch[j].name}" has ${vec ? vec.length : 0} dims, expected ${EMBED_DIM}`);
+      }
+      const row = names.length;
+      names.push(batch[j].name);
+      for (let k = 0; k < EMBED_DIM; k++) {
+        vectorBuf.writeFloatLE(vec[k], (row * EMBED_DIM + k) * 4);
+      }
+      entries.push({ name: batch[j].name, embedding: Array.from(vec) });
     }
 
     done += batch.length;
@@ -84,52 +114,36 @@ async function main() {
     }
   }
 
-  const output = {
-    model: embeddingService.MODEL_NAME,
-    dim: embeddingService.EMBED_DIM,
-    manifestChecksum,
-    generatedAt: new Date().toISOString(),
-    entries,
-  };
+  const generatedAt = new Date().toISOString();
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  fs.mkdirSync(path.dirname(OUT_PATH), { recursive: true });
-  fs.writeFileSync(OUT_PATH, JSON.stringify(output));
-
-  const sizeMB = (fs.statSync(OUT_PATH).size / 1024 / 1024).toFixed(1);
-  const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[build-embeddings] done. ${entries.length} vectors × ${output.dim} dims = ${sizeMB} MB in ${totalSec}s`);
-  console.log(`[build-embeddings] wrote ${path.relative(ROOT, OUT_PATH)}`);
-
-  // Binary format: tiny index JSON + raw Float32 blob (zero-parse at load time)
-  const INDEX_PATH = path.join(ROOT, 'data', 'library-embeddings.index.json');
-  const VECTORS_PATH = path.join(ROOT, 'data', 'library-embeddings.f32');
-  const EMBED_DIM = embeddingService.EMBED_DIM;
-
-  fs.writeFileSync(INDEX_PATH, JSON.stringify({
+  // Binaries first (what the server actually loads), JSON fallback last.
+  writeAtomic(VECTORS_PATH, vectorBuf);
+  writeAtomic(INDEX_PATH, JSON.stringify({
     format: 'binary-f32',
     version: 1,
     model: embeddingService.MODEL_NAME,
     dim: EMBED_DIM,
-    count: entries.length,
+    count: names.length,
     manifestChecksum,
-    generatedAt: output.generatedAt,
-    names: entries.map(e => e.name),
+    generatedAt,
+    names,
+  }));
+  writeAtomic(OUT_PATH, JSON.stringify({
+    model: embeddingService.MODEL_NAME,
+    dim: EMBED_DIM,
+    manifestChecksum,
+    generatedAt,
+    entries,
   }));
 
-  const vectorBuf = Buffer.alloc(entries.length * EMBED_DIM * 4);
-  for (let i = 0; i < entries.length; i++) {
-    const offset = i * EMBED_DIM * 4;
-    for (let j = 0; j < EMBED_DIM; j++) {
-      vectorBuf.writeFloatLE(entries[i].embedding[j], offset + j * 4);
-    }
-  }
-  fs.writeFileSync(VECTORS_PATH, vectorBuf);
-
+  const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
   const binMB = (vectorBuf.length / 1024 / 1024).toFixed(1);
-  console.log(`[build-embeddings] binary: ${path.relative(ROOT, VECTORS_PATH)} (${binMB} MB)`);
+  console.log(`[build-embeddings] done. ${names.length} vectors × ${EMBED_DIM} dims in ${totalSec}s`);
+  console.log(`[build-embeddings] binary: ${path.relative(ROOT, VECTORS_PATH)} (${binMB} MB), index + JSON alongside`);
 }
 
 main().catch(err => {
-  console.error('[build-embeddings] failed:', err);
+  console.error('[build-embeddings] failed:', err.message);
   process.exit(1);
 });

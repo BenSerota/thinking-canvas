@@ -54,6 +54,28 @@ function humanize(kebab) {
   return kebab.replace(/-/g, ' ');
 }
 
+// Font Awesome ships a label + search terms per icon ("hat-wizard" →
+// "accessory, costume, fantasy, halloween, mage, magic, witch, wizard…").
+// Embedding them alongside the display name makes retrieval far less
+// literal. Material Symbols ships no such metadata.
+const FA_META_PATH = path.join(ROOT, 'node_modules', '@fortawesome', 'fontawesome-free', 'metadata', 'icon-families.json');
+let faMeta = {};
+try {
+  faMeta = JSON.parse(fs.readFileSync(FA_META_PATH, 'utf-8'));
+} catch (_) {
+  console.warn('[fetch-icons] Font Awesome metadata not found — embeddings will use display names only');
+}
+
+function faSearchText(kebab) {
+  const entry = faMeta[kebab];
+  if (!entry) return '';
+  const parts = [];
+  if (typeof entry.label === 'string') parts.push(entry.label);
+  const terms = entry.search && entry.search.terms;
+  if (Array.isArray(terms)) for (const t of terms) if (typeof t === 'string') parts.push(t);
+  return parts.join(', ');
+}
+
 /**
  * Fast structural check — returns { ok: boolean, reason?: string } without
  * full XML parsing (we do that at load time anyway, just need to filter here).
@@ -169,7 +191,7 @@ function main() {
   console.log('[fetch-icons] scanning Font Awesome Solid...');
   const faIcons = collectIcons(FA_DIR, (file) => {
     return toKebab(file);
-  }).map(i => ({ ...i, source: 'fa-solid' }));
+  }).map(i => ({ ...i, source: 'fa-solid', searchText: faSearchText(i.name) }));
   console.log(`  → ${faIcons.length} valid Font Awesome icons`);
 
   // 2. Material Symbols Filled — only *-fill.svg, strip "-fill" suffix
@@ -177,7 +199,7 @@ function main() {
   const msIcons = collectIcons(MS_DIR, (file) => {
     if (!file.endsWith('-fill.svg')) return null;
     return toKebab(file.replace(/-fill\.svg$/, ''));
-  }).map(i => ({ ...i, source: 'material' }));
+  }).map(i => ({ ...i, source: 'material', searchText: '' }));
   console.log(`  → ${msIcons.length} valid Material Symbols icons`);
 
   // 3. Merge, preferring Material Symbols on name collision (see header comment).
@@ -207,6 +229,7 @@ function main() {
       name: icon.name,
       displayName: icon.displayName,
       source: icon.source,
+      searchText: icon.searchText || '',
     });
   }
 
