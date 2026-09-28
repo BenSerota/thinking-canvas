@@ -2,35 +2,33 @@
  * Iconify Service
  *
  * Resolves a free-form iconic concept (e.g., "octopus", "teacup") to a
- * path-based single-color SVG pulled from api.iconify.design.
- *
- * Runs BEFORE the local icon-matcher in shape-service.resolveVisual, so a
- * successful Iconify hit preempts our embedding-based library lookup. This
- * gives us ~200,000 icons across 150+ sets (Material Symbols, Tabler,
- * Phosphor, Lucide, Heroicons, Carbon, MDI, Game Icons, and more) instead
- * of just the 5,497 FA Solid + Material Symbols icons in our local library.
+ * path-based single-color SVG pulled from api.iconify.design (~200,000
+ * icons across 150+ sets: Material Symbols, Tabler, Phosphor, Lucide,
+ * Heroicons, Carbon, MDI, Game Icons, and more).
  *
  * Pipeline (cache-miss path):
- *   1. GET /search?query={q}&limit=8           — returns ranked icons + collection metadata
+ *   1. GET /search?query={q}&limit=8           — ranked icons + collection metadata
  *   2. Filter results by:
- *        - License in LICENSE_WHITELIST (commercial-safe OSS)
+ *        - License in LICENSE_WHITELIST
  *        - collections[prefix].palette === false  (single-color, not multicolor emoji)
- *        - collections[prefix].tags does not include "Uses Stroke" (our rasterizer
- *          renders fills only; stroke-only icons would vanish)
- *   3. GET /{prefix}/{name}.svg for the top-ranked passing result
- *   4. Sanitize (see sanitizeSvg below); if rejected, try the next candidate
+ *        - collections[prefix].tags does not include "Uses Stroke"
+ *   3. GET /{prefix}/{name}.svg for the top-ranked passing results (max 4)
+ *   4. Sanitize (see sanitizeSvg); if rejected, try the next candidate
  *   5. Write to public/shapes/iconify-cache/{kebab}.svg + return
  *
- * Cache-hit path: check public/shapes/iconify-cache/{kebab}.svg → return the
- * URL without calling the API.
+ * Cache-hit path: public/shapes/iconify-cache/{kebab}.svg exists → return the
+ * URL without calling the API. Confirmed misses are remembered in memory for
+ * NEGATIVE_TTL_MS so repeat concepts don't re-pay the search round-trip.
  *
- * Non-blocking by design: all calls are wrapped in a 2-second AbortController
- * timeout. On timeout/network error, the function returns null and the
- * shape-service falls through to the local matcher.
+ * Non-blocking by design: every call has a hard timeout AND a byte cap on
+ * the body (enforced while streaming, not after buffering). On any failure
+ * the function returns null and the shape-service falls through.
  */
 
 const fs = require('fs');
 const path = require('path');
+const { DOMParser } = require('@xmldom/xmldom');
+const { toKebab } = require('./utils');
 
 const ROOT = path.resolve(__dirname, '..');
 const CACHE_DIR = path.join(ROOT, 'public', 'shapes', 'iconify-cache');
@@ -40,7 +38,10 @@ const CACHE_URL_PREFIX = '/shapes/iconify-cache';
 const API_BASE = 'https://api.iconify.design';
 const FETCH_TIMEOUT_MS = 2000;
 const MAX_SVG_BYTES = 20_000;
+const MAX_SEARCH_BYTES = 200_000;
 const SEARCH_LIMIT = 8;
+const MAX_CANDIDATE_FETCHES = 4;
+const NEGATIVE_TTL_MS = 60 * 60 * 1000;
 
 // Commercial-safe OSS licenses only. Iconify exposes the SPDX ID per set in
 // the search response (collections[prefix].license.spdx). We exclude
@@ -64,55 +65,155 @@ if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
-const { toKebab } = require('./utils');
+// concept kebab → timestamp of the last confirmed miss
+const negativeCache = new Map();
 
-/** Fetch with a hard timeout. Returns { ok, status, text } or throws on timeout/network. */
-async function fetchWithTimeout(url, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+function isNegativelyCached(kebab) {
+  const at = negativeCache.get(kebab);
+  if (at === undefined) return false;
+  if (Date.now() - at > NEGATIVE_TTL_MS) {
+    negativeCache.delete(kebab);
+    return false;
+  }
+  return true;
+}
+
+/** Read a fetch body with a byte cap enforced as chunks arrive. */
+async function readCapped(res, maxBytes, controller) {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    controller.abort();
+    throw new Error(`body too large (${declared} > ${maxBytes} bytes)`);
+  }
+  if (!res.body) return '';
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of res.body) {
+    total += chunk.byteLength;
+    if (total > maxBytes) {
+      controller.abort();
+      throw new Error(`body exceeded ${maxBytes} bytes`);
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/** Fetch with a hard timeout and byte cap. Returns { ok, status, text } or throws. */
+async function fetchWithTimeout(url, { timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_SVG_BYTES } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { signal: controller.signal });
-    const text = await res.text();
+    const text = await readCapped(res, maxBytes, controller);
     return { ok: res.ok, status: res.status, text };
   } finally {
     clearTimeout(timer);
   }
 }
 
+// ─── Sanitizer ───
+
+const ALLOWED_ELEMENTS = new Set(['svg', 'g', 'path']);
+const FORBIDDEN_ATTRS = new Set(['style', 'transform', 'href', 'xlink:href']);
+// Presentation attributes the client rasterizer reads; resolved through the
+// group hierarchy and written directly on each path so the output has no
+// groups at all.
+const INHERITED_ATTRS = ['fill', 'fill-rule', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin'];
+
+function localName(el) {
+  return String(el.localName || el.tagName || '').split(':').pop().toLowerCase();
+}
+
+function parseViewBox(value) {
+  const parts = String(value || '').trim().split(/[\s,]+/).map(Number);
+  if (parts.length !== 4 || parts.some(n => !Number.isFinite(n)) || parts[2] <= 0 || parts[3] <= 0) return null;
+  return parts;
+}
+
+function resolveAttr(el, name) {
+  for (let node = el; node && node.nodeType === 1; node = node.parentNode) {
+    const v = node.getAttribute(name);
+    if (v != null && v !== '') return v;
+  }
+  return null;
+}
+
+function escapeAttr(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /**
- * Sanitize an SVG string. Returns the original string if clean, null if
- * rejected. Defensive — Iconify is usually trustworthy but we never cache
- * anything that can't be rasterized by our path-only parser or that could
- * introduce security risk.
+ * Sanitize an SVG string by parsing it and re-serializing only what the
+ * rasterizer needs: a viewBox and <path> elements with resolved presentation
+ * attributes. Returns the clean string, or null if rejected.
+ *
+ * Rejects: anything that isn't svg/g/path (so <a>, <set>, <use>, <script>,
+ * <style>, <image>, <foreignObject>, <animate*>, <defs>, <mask>, <text>…),
+ * any on* / style / transform / href attribute, DOCTYPE/entities, a missing
+ * or malformed viewBox, oversize bodies, and files with no visible path.
+ *
+ * Drops: paths whose effective fill is `none` and that have no stroke — the
+ * invisible bounding-box placeholders some sets (mingcute) emit, which the
+ * fill rasterizer would otherwise render as a speck or a solid square.
  */
 function sanitizeSvg(svg) {
   if (!svg) return null;
-  // Must look like an SVG at the top (guards against HTML error pages being cached)
   const trimmed = svg.trimStart();
   if (!trimmed.startsWith('<?xml') && !trimmed.startsWith('<svg')) return null;
   if (svg.length > MAX_SVG_BYTES) return null;
+  if (/<!DOCTYPE|<!ENTITY/i.test(svg)) return null;
 
-  // Security + rasterizer-compatibility rejects
-  if (/<script\b/i.test(svg)) return null;
-  if (/<foreignObject\b/i.test(svg)) return null;
-  if (/<image\b/i.test(svg)) return null;
-  if (/<style\b/i.test(svg)) return null;
-  if (/<animate/i.test(svg)) return null;
-  if (/\bon\w+\s*=/i.test(svg)) return null;
-  if (/xlink:href\s*=\s*["']https?:/i.test(svg)) return null;
-  if (/href\s*=\s*["']https?:/i.test(svg)) return null;
+  let doc;
+  try {
+    doc = new DOMParser({
+      onError: (level, msg) => { if (level === 'fatalError') throw new Error(msg); },
+    }).parseFromString(svg, 'image/svg+xml');
+  } catch (_) {
+    return null;
+  }
+  const root = doc.documentElement;
+  if (!root || localName(root) !== 'svg') return null;
+  const viewBox = parseViewBox(root.getAttribute('viewBox'));
+  if (!viewBox) return null;
 
-  // Our rasterizer (public/js/shapes.js loadExternalShape) only processes
-  // <path> elements. No <path> = nothing to render.
-  if (!/<path\b/i.test(svg)) return null;
+  const paths = [];
+  const walk = (el) => {
+    if (!ALLOWED_ELEMENTS.has(localName(el))) throw new Error('element not allowed');
+    for (let i = 0; i < el.attributes.length; i++) {
+      const name = el.attributes[i].name.toLowerCase();
+      if (name.startsWith('on') || FORBIDDEN_ATTRS.has(name)) throw new Error('attribute not allowed');
+    }
+    if (localName(el) === 'path') paths.push(el);
+    for (let c = el.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 1) walk(c);
+    }
+  };
+  try {
+    walk(root);
+  } catch (_) {
+    return null;
+  }
 
-  // MVP: reject any <g transform>. Many Iconify sets use transforms for
-  // grid-aligned layout; those render mis-scaled / mis-positioned because our
-  // loadExternalShape ignores transforms. Log and fall through so the caller
-  // tries the next candidate.
-  if (/<g\s+[^>]*\btransform\s*=/i.test(svg)) return null;
+  const out = [];
+  for (const p of paths) {
+    const d = (p.getAttribute('d') || '').trim();
+    if (!d) continue;
+    const fill = resolveAttr(p, 'fill');
+    const stroke = resolveAttr(p, 'stroke');
+    const hasStroke = Boolean(stroke) && stroke !== 'none';
+    const invisible = fill === 'none' || resolveAttr(p, 'opacity') === '0' || resolveAttr(p, 'fill-opacity') === '0';
+    if (invisible && !hasStroke) continue;
+    const attrs = [`d="${escapeAttr(d)}"`];
+    for (const name of INHERITED_ATTRS) {
+      const v = resolveAttr(p, name);
+      if (v != null) attrs.push(`${name}="${escapeAttr(v)}"`);
+    }
+    out.push(`<path ${attrs.join(' ')}/>`);
+  }
+  if (out.length === 0) return null;
 
-  return svg;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox.join(' ')}">${out.join('')}</svg>`;
 }
 
 /**
@@ -138,10 +239,7 @@ function passesPreFilter(prefix, collections) {
 /**
  * Given an iconic concept, try to find and cache an Iconify SVG for it.
  * Returns { name, url, prefix, license, source: 'iconify' } on success,
- * or null on any failure (fall through to matcher).
- *
- * The caller (shape-service.resolveVisual) treats null as "no match" and
- * continues to the next step in the resolution ladder.
+ * or null on any failure (fall through to the next tier).
  */
 async function findAndCache(iconic) {
   const kebab = toKebab(iconic);
@@ -160,11 +258,14 @@ async function findAndCache(iconic) {
     };
   }
 
-  // 2. Search Iconify
+  // 2. Remembered miss — skip the search round-trip
+  if (isNegativelyCached(kebab)) return null;
+
+  // 3. Search Iconify
   let searchJson;
   try {
     const url = `${API_BASE}/search?query=${encodeURIComponent(iconic)}&limit=${SEARCH_LIMIT}`;
-    const res = await fetchWithTimeout(url);
+    const res = await fetchWithTimeout(url, { maxBytes: MAX_SEARCH_BYTES });
     if (!res.ok) {
       console.warn(`[iconify] search HTTP ${res.status} for "${iconic}"`);
       return null;
@@ -179,11 +280,14 @@ async function findAndCache(iconic) {
   const collections = searchJson.collections || {};
   if (icons.length === 0) {
     console.log(`[iconify] "${iconic}" → no match`);
+    negativeCache.set(kebab, Date.now());
     return null;
   }
 
-  // 3. Walk ranked results; first one that passes pre-filter AND sanitize wins
+  // 4. Walk ranked results; first one that passes pre-filter AND sanitize wins
+  let fetched = 0;
   for (const id of icons) {
+    if (fetched >= MAX_CANDIDATE_FETCHES) break;
     const sep = id.indexOf(':');
     if (sep < 0) continue;
     const prefix = id.slice(0, sep);
@@ -192,8 +296,8 @@ async function findAndCache(iconic) {
 
     let svg;
     try {
-      const url = `${API_BASE}/${prefix}/${iconName}.svg`;
-      const res = await fetchWithTimeout(url);
+      fetched++;
+      const res = await fetchWithTimeout(`${API_BASE}/${prefix}/${iconName}.svg`);
       if (!res.ok) continue;
       svg = res.text;
     } catch (err) {
@@ -202,12 +306,9 @@ async function findAndCache(iconic) {
     }
 
     const clean = sanitizeSvg(svg);
-    if (!clean) {
-      // Quiet — we iterate; a common reason (transforms, strokes) happens often
-      continue;
-    }
+    if (!clean) continue;
 
-    // 4. Cache to disk under the original concept's kebab so future lookups
+    // 5. Cache to disk under the original concept's kebab so future lookups
     //    hit step 1. Not the icon's own name — we key on user intent.
     try {
       fs.writeFileSync(cachePath, clean, 'utf-8');
@@ -228,12 +329,13 @@ async function findAndCache(iconic) {
   }
 
   console.log(`[iconify] "${iconic}" → no usable match (${icons.length} candidates filtered out)`);
+  negativeCache.set(kebab, Date.now());
   return null;
 }
 
 module.exports = {
   findAndCache,
-  // Exported for tests and for resolveVisual debugging
+  sanitizeSvg,
   CACHE_DIR,
   CACHE_URL_PREFIX,
   LICENSE_WHITELIST,

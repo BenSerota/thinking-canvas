@@ -1,18 +1,18 @@
 /**
  * Chat Service
  *
- * Wraps the Anthropic SDK for streaming with extended thinking.
+ * Wraps the Anthropic SDK for streaming with adaptive thinking.
  * Concept extraction is handled by the visual-extractor (Haiku) service,
- * which we kick off at request start — BEFORE the Sonnet stream call — so
- * Haiku and Sonnet run truly in parallel from t=0. Previously Haiku waited
- * on Sonnet's thinking block to complete, adding 1-3 s to "first shape"
- * latency. Haiku's prompt handles an empty context string, and the tiny
- * quality loss from skipping the thinking buffer is dwarfed by the timing win.
+ * kicked off at request start — BEFORE the main stream call — so Haiku and
+ * the chat model run in parallel from t=0. The extractor also receives a
+ * compact slice of the recent conversation so follow-ups ("tell me more")
+ * resolve to the actual subject instead of the literal follow-up text.
  *
  * Yields typed events:
- *   { type: 'thinking_text', text }            — raw thinking block content
- *   { type: 'visual_concepts', visuals }       — from Haiku extraction
- *   { type: 'text', text }                     — response text
+ *   { type: 'thinking_delta', text }        — chunk of the thinking block
+ *   { type: 'thinking_done' }               — thinking block finished
+ *   { type: 'visual_concepts', visuals }    — from Haiku extraction
+ *   { type: 'text', text }                  — response text chunk
  *   { type: 'done' }
  */
 
@@ -22,37 +22,98 @@ const conceptService = require('./concept-service'); // fallback only
 
 const anthropic = new Anthropic();
 
-const SYSTEM_PROMPT = `You are a friendly, conversational AI assistant called Thinking Canvas. You're embedded in a visual interface where particles on a canvas form shapes related to the conversation topic. Keep your responses concise but helpful (2-4 sentences typically). Be warm and engaging.`;
+const PRIMARY_MODEL = 'claude-sonnet-5';
+// Degraded mode if the primary model is unavailable. Haiku 4.5 uses the
+// older thinking API, so the fallback request carries no `thinking` param.
+const FALLBACK_MODEL = 'claude-haiku-4-5';
+// Adaptive thinking output counts toward max_tokens; the system prompt asks
+// for 2-4 sentences, so this is headroom for thinking, not for long replies.
+const MAX_TOKENS = 8192;
+const FALLBACK_MAX_TOKENS = 1024;
+const HISTORY_TURNS = 10;
+const EXTRACTOR_CONTEXT_TURNS = 4;
+const EXTRACTOR_CONTEXT_CHARS = 200;
+
+const SYSTEM_PROMPT = `You are a friendly, conversational AI assistant called Thinking Canvas. You're embedded in a visual interface where particles on a canvas form shapes related to the conversation topic. Keep your responses concise but helpful (2-4 sentences typically). Be warm and engaging. Use plain conversational text — no markdown formatting.`;
+
+/** Text of a history entry, or null if the entry is malformed. */
+function entryText(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+  const text = typeof msg.content === 'string' ? msg.content : msg.text;
+  return typeof text === 'string' && text.trim().length > 0 ? text : null;
+}
 
 /**
  * Build the messages array from conversation history + current message.
+ * Malformed entries are skipped rather than forwarded (an entry without a
+ * string content would 400 the whole turn).
  */
 function buildMessages(message, history) {
   const messages = [];
-  if (history && history.length > 0) {
-    const recent = history.slice(-10);
-    for (const msg of recent) {
-      messages.push({
-        role: msg.role === 'user' ? 'user' : 'assistant',
-        content: msg.content || msg.text,
-      });
+  if (Array.isArray(history) && history.length > 0) {
+    for (const msg of history.slice(-HISTORY_TURNS)) {
+      const text = entryText(msg);
+      if (text === null) continue;
+      messages.push({ role: msg.role === 'user' ? 'user' : 'assistant', content: text });
     }
   }
   messages.push({ role: 'user', content: message });
   return messages;
 }
 
+/** Last few turns, clipped, as "role: text" lines for the extractor prompt. */
+function buildExtractorContext(history) {
+  if (!Array.isArray(history)) return '';
+  const lines = [];
+  for (const msg of history.slice(-EXTRACTOR_CONTEXT_TURNS)) {
+    const text = entryText(msg);
+    if (text === null) continue;
+    const role = msg.role === 'user' ? 'user' : 'assistant';
+    const flat = text.replace(/\s+/g, ' ').trim();
+    const clipped = flat.length > EXTRACTOR_CONTEXT_CHARS ? flat.slice(0, EXTRACTOR_CONTEXT_CHARS) + '…' : flat;
+    lines.push(`${role}: ${clipped}`);
+  }
+  return lines.join('\n');
+}
+
+// 429 / 5xx / connection failures deserve one retry on the primary model;
+// anything else (retired model 404, bad params 400) goes straight to the
+// fallback model. Connection errors carry no `.status`, so test the class.
+function isRetryable(err) {
+  if (err instanceof Anthropic.APIConnectionError) return true;
+  const status = err && err.status;
+  return status === 429 || (typeof status === 'number' && status >= 500);
+}
+
+function isAbort(err, signal) {
+  if (signal && signal.aborted) return true;
+  if (err instanceof Anthropic.APIUserAbortError) return true;
+  return Boolean(err && err.name === 'AbortError');
+}
+
+function openStream(params, signal) {
+  return anthropic.messages.create(params, signal ? { signal } : undefined);
+}
+
 /**
  * Create a streaming chat session.
- * Returns an async generator that yields typed events.
+ * Returns an async generator that yields typed events. `signal` (optional)
+ * aborts the upstream request when the client disconnects.
  */
-async function* createStream(message, history) {
+async function* createStream(message, history, signal) {
   const messages = buildMessages(message, history);
 
-  const streamParams = {
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 16000,
-    thinking: { type: 'enabled', budget_tokens: 2048 },
+  const primaryParams = {
+    model: PRIMARY_MODEL,
+    max_tokens: MAX_TOKENS,
+    thinking: { type: 'adaptive', display: 'summarized' },
+    system: SYSTEM_PROMPT,
+    messages,
+    stream: true,
+  };
+  const fallbackParams = {
+    model: FALLBACK_MODEL,
+    max_tokens: FALLBACK_MAX_TOKENS,
     system: SYSTEM_PROMPT,
     messages,
     stream: true,
@@ -64,80 +125,77 @@ async function* createStream(message, history) {
   let haikuYielded = false;
   let haikuResult = null;
 
-  // Kick off Haiku concept extraction BEFORE opening the Sonnet stream so the
-  // two calls run truly in parallel. Haiku typically returns in 500-1500 ms;
-  // by starting it at t=0 rather than post-thinking we shave 1-3 s off "first
-  // shape appears on canvas."
-  //
-  // A `.then` handler flips `haikuResolved` when the call completes. The
-  // Sonnet event loop below polls this flag on each iteration and yields
-  // `visual_concepts` the first time it sees `resolved && !yielded`. Using a
-  // flag instead of `Promise.race([p.then(...), Promise.resolve(false)])` —
-  // the old pattern silently lost every race because `Promise.resolve` is
-  // already-settled and always won the microtask queue.
+  // Kick off Haiku concept extraction BEFORE opening the chat stream so the
+  // two calls run truly in parallel. A `.then` handler flips `haikuResolved`;
+  // the event loop below polls the flag and yields `visual_concepts` the
+  // first time it sees it set.
   const haikuPromise = visualExtractor
-    .extractVisualConcepts(message, '')
+    .extractVisualConcepts(message, buildExtractorContext(history))
     .then(r => { haikuResult = r; haikuResolved = true; return r; })
-    .catch(err => { console.warn('Haiku failed:', err.message); haikuResolved = true; return null; });
+    .catch(err => { console.warn('[chat] Haiku extraction failed:', err.message); haikuResolved = true; return null; });
 
   let stream;
   try {
-    stream = await anthropic.messages.create(streamParams);
+    stream = await openStream(primaryParams, signal);
   } catch (err) {
-    // Fall back to non-thinking streaming. Haiku is already in flight —
-    // nothing else to do here.
-    console.warn('Extended thinking failed, falling back:', err.message);
-    const fallbackParams = { ...streamParams, max_tokens: 1024 };
-    delete fallbackParams.thinking;
-    stream = await anthropic.messages.create(fallbackParams);
-  }
-
-  for await (const event of stream) {
-    // --- Non-blocking check: has Haiku resolved? Yield concepts mid-stream. ---
-    if (haikuResolved && !haikuYielded) {
-      haikuYielded = true;
-      if (haikuResult && haikuResult.length > 0) {
-        yield { type: 'visual_concepts', visuals: haikuResult };
+    if (isAbort(err, signal)) return;
+    if (isRetryable(err)) {
+      console.warn(`[chat] ${PRIMARY_MODEL} transient failure (${err.status || err.name}) — retrying once`);
+      try {
+        stream = await openStream(primaryParams, signal);
+      } catch (err2) {
+        if (isAbort(err2, signal)) return;
+        console.warn(`[chat] retry failed (${err2.status || err2.name}) — falling back to ${FALLBACK_MODEL}`);
+        stream = await openStream(fallbackParams, signal);
       }
-    }
-
-    // --- Track block types ---
-    if (event.type === 'content_block_start') {
-      currentBlockType = event.content_block?.type || null;
-      if (currentBlockType === 'thinking') thinkingBuffer = '';
-      continue;
-    }
-
-    // --- Accumulate thinking ---
-    if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta') {
-      thinkingBuffer += event.delta.thinking;
-      continue;
-    }
-
-    // --- Block ends ---
-    if (event.type === 'content_block_stop') {
-      if (currentBlockType === 'thinking' && thinkingBuffer.length > 0) {
-        // Yield thinking text for the collapsible UI. Haiku extraction was
-        // already kicked off at request start; by the time thinking ends,
-        // Haiku concepts are usually already yielded by the flag-poll check
-        // at the top of the loop.
-        yield { type: 'thinking_text', text: thinkingBuffer };
-      }
-      currentBlockType = null;
-      continue;
-    }
-
-    // --- Stream response text ---
-    if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-      yield { type: 'text', text: event.delta.text };
+    } else {
+      console.warn(`[chat] ${PRIMARY_MODEL} failed (${err.status || err.name}: ${err.message}) — falling back to ${FALLBACK_MODEL}`);
+      stream = await openStream(fallbackParams, signal);
     }
   }
 
-  // --- After stream ends: ensure Haiku concepts arrive ---
-  // If the mid-stream poll never caught Haiku (Sonnet finished before Haiku
-  // did), await it here. The .then handler has already populated haikuResult
-  // and flipped haikuResolved — we just need to wait for the promise chain
-  // to settle before yielding.
+  try {
+    for await (const event of stream) {
+      if (haikuResolved && !haikuYielded) {
+        haikuYielded = true;
+        if (haikuResult && haikuResult.length > 0) {
+          yield { type: 'visual_concepts', visuals: haikuResult };
+        }
+      }
+
+      if (event.type === 'content_block_start') {
+        currentBlockType = event.content_block?.type || null;
+        if (currentBlockType === 'thinking') thinkingBuffer = '';
+        continue;
+      }
+
+      if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta') {
+        const text = event.delta.thinking;
+        if (text) {
+          thinkingBuffer += text;
+          yield { type: 'thinking_delta', text };
+        }
+        continue;
+      }
+
+      if (event.type === 'content_block_stop') {
+        if (currentBlockType === 'thinking') yield { type: 'thinking_done' };
+        currentBlockType = null;
+        continue;
+      }
+
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        yield { type: 'text', text: event.delta.text };
+      }
+    }
+  } catch (err) {
+    if (isAbort(err, signal)) return;
+    throw err;
+  }
+
+  if (signal && signal.aborted) return;
+
+  // If the mid-stream poll never caught Haiku (chat finished first), wait.
   if (!haikuYielded) {
     await haikuPromise;
     haikuYielded = true;
@@ -146,7 +204,7 @@ async function* createStream(message, history) {
     }
   }
 
-  // --- Fallback: if Haiku returned nothing, use regex ---
+  // Fallback: if Haiku returned nothing, use the regex keyword map.
   if (!haikuResult || haikuResult.length === 0) {
     const fallbackText = (thinkingBuffer + ' ' + message).trim();
     const concepts = conceptService.extractConceptsFromText(fallbackText, 3);
@@ -165,5 +223,8 @@ async function* createStream(message, history) {
 module.exports = {
   createStream,
   buildMessages,
+  buildExtractorContext,
   SYSTEM_PROMPT,
+  PRIMARY_MODEL,
+  FALLBACK_MODEL,
 };

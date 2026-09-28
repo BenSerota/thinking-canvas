@@ -106,9 +106,10 @@ export class ChatPanel {
   }
 
   /**
-   * Add a collapsible thinking block showing the LLM's internal reasoning.
+   * Add a collapsible thinking block that fills in as the model's reasoning
+   * streams. Returns a controller object with { append(text), finish() }.
    */
-  addThinkingMessage(text) {
+  addStreamingThinking() {
     const msgEl = document.createElement('div');
     msgEl.className = 'chat-message chat-message-thinking';
 
@@ -116,17 +117,29 @@ export class ChatPanel {
     details.className = 'chat-thinking';
 
     const summary = document.createElement('summary');
-    summary.textContent = 'Thinking...';
+    summary.textContent = 'Thinking…';
 
     const content = document.createElement('div');
     content.className = 'chat-thinking-content';
-    content.textContent = text;
 
     details.appendChild(summary);
     details.appendChild(content);
     msgEl.appendChild(details);
     this.messagesEl.appendChild(msgEl);
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+
+    let fullText = '';
+    return {
+      append: (text) => {
+        fullText += text;
+        content.textContent = fullText;
+        content.scrollTop = content.scrollHeight;
+        this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+      },
+      finish: () => {
+        summary.textContent = 'Thought process';
+      },
+    };
   }
 
   setInputEnabled(enabled) {

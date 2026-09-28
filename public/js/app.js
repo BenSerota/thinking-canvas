@@ -89,13 +89,19 @@ class App {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
-          history: this.chat.getHistory().slice(0, -1),
+          // The server only uses the last 10 turns and rejects more than 50
+          // entries — never send more than it will read.
+          history: this.chat.getHistory().slice(0, -1).slice(-10),
         }),
       });
+      if (!response.ok) {
+        throw new Error(`Chat request failed (${response.status})`);
+      }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let stream = null;
+      let thinking = null;
       let buffer = '';
 
       while (true) {
@@ -116,12 +122,20 @@ class App {
           }
 
           switch (data.type) {
-            case 'thinking':
-              this.chat.addThinkingMessage(data.text);
+            case 'thinking_delta':
+              if (!thinking) thinking = this.chat.addStreamingThinking();
+              thinking.append(data.text);
               this.canvas.setState('thinking');
               break;
 
+            case 'thinking_done':
+              if (thinking) thinking.finish();
+              break;
+
             case 'concept_resolved':
+              // Adaptive thinking may skip thinking entirely on simple turns,
+              // so any first sign of life moves the canvas out of 'gathering'.
+              this.canvas.setState('thinking');
               if (data.shape) {
                 await this._onConceptResolved(data.shape);
                 await nextFrame();
@@ -132,17 +146,16 @@ class App {
               await this._onConceptsDone();
               break;
 
-            case 'concepts':
-              // Legacy batched payload — retained for any non-streaming path.
-              this.canvas.interimMode = false;
-              this._startConceptCycle(data.concepts || []);
-              break;
-
             case 'text':
+              this.canvas.setState('thinking');
               if (!stream) {
                 stream = this.chat.addStreamingMessage('assistant');
               }
               stream.append(data.text);
+              break;
+
+            case 'error':
+              this.chat.addMessage('assistant', data.message || 'Something went wrong. Please try again.');
               break;
 
             case 'done':
@@ -153,7 +166,7 @@ class App {
       }
     } catch (error) {
       console.error('Chat error:', error);
-      this.canvas.setState('idle');
+      this._settleEmptyTurn();
       this.chat.addMessage('assistant', 'Sorry, something went wrong. Please try again.');
     }
 
@@ -221,9 +234,16 @@ class App {
   async _onConceptsDone() {
     const allShapes = this.turnShapes.filter(s => s._points && s._points.length > 0);
 
-    if (allShapes.length < 2) {
-      // Nothing to arrange — single (or zero) shape, just stop cycling.
+    if (allShapes.length === 0) {
+      // Nothing visual came of this turn — don't leave the hurricane and
+      // "I'm thinking about…" running forever.
+      this._settleEmptyTurn();
+      return;
+    }
+    if (allShapes.length === 1) {
+      // Single shape: keep it, but the thinking title has done its job.
       this._clearConceptCycle();
+      this.canvas.clearThinkingTitle();
       return;
     }
 
@@ -432,6 +452,13 @@ class App {
     const combined = points.concat(trail);
     combined.aspectRatio = points.aspectRatio;
     this.canvas.setThinkingTitle(combined);
+  }
+
+  /** End a turn that produced no shapes: drop the thinking title, calm down. */
+  _settleEmptyTurn() {
+    this._clearConceptCycle();
+    this.canvas.clearThinkingTitle();
+    this.canvas.setState('idle');
   }
 
   _clearConceptCycle() {

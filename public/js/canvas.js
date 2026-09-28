@@ -178,10 +178,10 @@ export class ThinkingCanvas {
 
   setState(newState) {
     if (this.state === newState) return;
-    // Protect settled/forming from being overwritten by late 'thinking'
-    // SSE events that arrive after the shapes have already landed. Only
-    // 'gathering' (new user turn) is allowed to tear down shapes.
-    if (newState === 'thinking' && (this.state === 'settled' || this.state === 'forming')) {
+    // 'thinking' is a refinement of 'gathering' only. Text and concept events
+    // keep arriving after shapes have landed (forming/transitioning/settled)
+    // and must not tear them down or re-target particles mid-crossfade.
+    if (newState === 'thinking' && this.state !== 'gathering') {
       return;
     }
     this.state = newState;

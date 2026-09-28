@@ -17,43 +17,113 @@ const path = require('path');
 // Services
 const chatService = require('./services/chat-service');
 const shapeService = require('./services/shape-service');
-const conceptService = require('./services/concept-service'); // fallback only
 const iconMatcher = require('./services/icon-matcher');
 const emojiService = require('./services/emoji-service');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// Request limits. The API is unauthenticated on the public deploy, so every
+// bound here is a cost bound on Ben's API key.
+const MAX_MESSAGE_CHARS = 10000;
+const MAX_HISTORY_ENTRIES = 50;
+const MAX_HISTORY_ENTRY_CHARS = 4000;
+const RATE_WINDOW_MS = 5 * 60 * 1000;
+const RATE_MAX_REQUESTS = 20;
+const SSE_PING_MS = 15000;
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error('ERROR: ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key.');
   process.exit(1);
 }
 
-app.use(helmet({ contentSecurityPolicy: false }));
+// Render terminates TLS at a proxy; req.ip must come from X-Forwarded-For.
+app.set('trust proxy', 1);
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: {
+      'default-src': ["'self'"],
+      'script-src': ["'self'"],
+      'style-src': ["'self'", 'https://fonts.googleapis.com'],
+      'font-src': ["'self'", 'https://fonts.gstatic.com'],
+      'connect-src': ["'self'"],
+      'img-src': ["'self'", 'data:'],
+      'object-src': ["'none'"],
+      'base-uri': ["'self'"],
+      'form-action': ["'self'"],
+      'frame-ancestors': ["'self'"],
+    },
+  },
+}));
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+
+// Cached and generated SVGs are third-party or model-authored content. The
+// client only ever fetches them as text and parses them with DOMParser, but
+// serve them under a no-script sandbox so navigating to one directly can
+// never execute in the app origin even if a sanitizer slips.
+app.use('/shapes', express.static(path.join(PUBLIC_DIR, 'shapes'), {
+  setHeaders: (res) => res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox"),
+}));
+app.use(express.static(PUBLIC_DIR));
+
+// ─── Rate limiting: in-memory sliding window per IP ───
+const rateBuckets = new Map();
+
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || 'unknown';
+  const stamps = (rateBuckets.get(key) || []).filter(t => now - t < RATE_WINDOW_MS);
+  if (stamps.length >= RATE_MAX_REQUESTS) {
+    res.status(429).json({ error: 'Too many requests, slow down.' });
+    return;
+  }
+  stamps.push(now);
+  rateBuckets.set(key, stamps);
+  if (rateBuckets.size > 1000) {
+    for (const [ip, times] of rateBuckets) {
+      if (!times.some(t => now - t < RATE_WINDOW_MS)) rateBuckets.delete(ip);
+    }
+  }
+  next();
+}
+app.use('/api/', rateLimit);
+
+/** Returns an error string for a bad chat body, or null if it is acceptable. */
+function validateChatBody(body) {
+  const { message, history } = body || {};
+  if (!message || typeof message !== 'string') return 'No message provided';
+  if (message.length > MAX_MESSAGE_CHARS) return 'Message too long';
+  if (history !== undefined) {
+    if (!Array.isArray(history) || history.length > MAX_HISTORY_ENTRIES) return 'Invalid history';
+    for (const entry of history) {
+      if (!entry || typeof entry !== 'object' || typeof entry.role !== 'string' || typeof entry.content !== 'string') {
+        return 'Invalid history entry';
+      }
+      if (entry.content.length > MAX_HISTORY_ENTRY_CHARS) return 'History entry too long';
+    }
+  }
+  return null;
+}
 
 /**
  * POST /api/chat/stream
  *
  * Pipeline:
- * 1. Chat Service → Sonnet extended thinking + streaming response
- * 2. Visual Extractor (Haiku) → fires concurrently after thinking block
- * 3. Shape Service → maps Haiku concepts to renderable shapes
- * 4. SSE → typed events to client
+ * 1. Chat Service → Sonnet 5 adaptive thinking + streaming response, with
+ *    the Haiku visual extractor started in parallel at t=0
+ * 2. Shape Service → resolves the extracted concepts concurrently, in a
+ *    detached task so reply text keeps streaming while shapes resolve
+ * 3. SSE → typed events to the client:
+ *    thinking_delta, thinking_done, concept_resolved, text, error,
+ *    concepts_done (always, possibly empty), done
  */
 app.post('/api/chat/stream', async (req, res) => {
+  const problem = validateChatBody(req.body);
+  if (problem) return res.status(400).json({ error: problem });
   const { message, history } = req.body;
-
-  if (!message || typeof message !== 'string') {
-    return res.status(400).json({ error: 'No message provided' });
-  }
-  if (message.length > 10000) {
-    return res.status(400).json({ error: 'Message too long' });
-  }
-  if (history && (!Array.isArray(history) || history.length > 50)) {
-    return res.status(400).json({ error: 'Invalid history' });
-  }
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -61,114 +131,91 @@ app.post('/api/chat/stream', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  // No immediate concepts — let canvas stay in gathering/thinking state
-  // Haiku will provide concepts when ready
+  // Detect a client disconnect on the RESPONSE: `res` emits 'close' when the
+  // socket goes away, and writableEnded is still false at that point. (The
+  // request's own 'close' fires as soon as its body is consumed, i.e. before
+  // this handler even runs — never abort on that.)
+  const ac = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+  const alive = () => !res.writableEnded && !res.destroyed && !ac.signal.aborted;
+  const send = (payload) => { if (alive()) res.write(`data: ${JSON.stringify(payload)}\n\n`); };
+  // Keep proxies from idling out the connection during a long resolution.
+  const ping = setInterval(() => { if (alive()) res.write(': ping\n\n'); }, SSE_PING_MS);
+
+  const collected = [];
+  let shapesDone = null;
+
+  const resolveShapes = async (visuals) => {
+    const iconics = visuals.map(v => v.iconic).filter(Boolean);
+    if (iconics.length > 0) console.log('[visuals] Iconic concepts:', iconics.join(', '));
+    try {
+      for await (const shape of shapeService.streamConceptShapes(visuals)) {
+        if (!alive()) break;
+        collected.push(shape);
+        const scoreStr = typeof shape.score === 'number' ? `, ${shape.score.toFixed(2)}` : '';
+        console.log(`[icons] "${shape.concept}" → ${shape.dynamic || shape.name} (${shape.source}${scoreStr})`);
+        send({ type: 'concept_resolved', shape });
+      }
+    } catch (err) {
+      console.error('[shapes] resolution failed:', err.message);
+    }
+  };
 
   try {
-    for await (const event of chatService.createStream(message, history)) {
-      if (res.writableEnded) break;
-
+    for await (const event of chatService.createStream(message, history, ac.signal)) {
+      if (!alive()) break;
       switch (event.type) {
-        case 'thinking_text': {
-          // Raw thinking text for collapsible UI
-          res.write(`data: ${JSON.stringify({ type: 'thinking', text: event.text })}\n\n`);
+        case 'thinking_delta':
+          send({ type: 'thinking_delta', text: event.text });
           break;
-        }
-
-        case 'visual_concepts': {
-          // Haiku-extracted iconic concepts → stream resolved shapes one-by-one.
-          // The client starts rendering the first shape as soon as it arrives,
-          // so slow svg-generator fallbacks for later shapes don't block shape 1.
-          const iconics = event.visuals.map(v => v.iconic).filter(Boolean);
-          if (iconics.length > 0) {
-            console.log('[visuals] Iconic concepts:', iconics.join(', '));
-          }
-
-          const collected = [];
-          for await (const shape of shapeService.streamConceptShapes(event.visuals)) {
-            if (res.writableEnded) break;
-            collected.push(shape);
-
-            const scoreStr = typeof shape.score === 'number' ? `, ${shape.score.toFixed(2)}` : '';
-            console.log(`[icons] "${shape.concept}" → ${shape.name}${shape.dynamic ? '.svg' : ''} (${shape.source}${scoreStr})`);
-
-            // Per-concept SSE — client renders immediately on first arrival
-            res.write(`data: ${JSON.stringify({ type: 'concept_resolved', shape })}\n\n`);
-          }
-
-          // Terminal event signals the client can stop expecting more shapes
-          // (e.g. to finalize the rotation-timer setup). Also sent as the
-          // legacy batched `concepts` payload for any older client paths.
-          if (!res.writableEnded) {
-            res.write(`data: ${JSON.stringify({ type: 'concepts_done', concepts: collected, source: 'haiku' })}\n\n`);
-          }
+        case 'thinking_done':
+          send({ type: 'thinking_done' });
           break;
-        }
-
-        case 'text': {
-          res.write(`data: ${JSON.stringify({ type: 'text', text: event.text })}\n\n`);
+        case 'visual_concepts':
+          // Run in the background — the chat stream keeps flowing meanwhile.
+          if (!shapesDone) shapesDone = resolveShapes(event.visuals);
           break;
-        }
-
-        case 'done': {
+        case 'text':
+          send({ type: 'text', text: event.text });
           break;
-        }
+        case 'done':
+          break;
       }
     }
   } catch (err) {
-    if (res.writableEnded) return;
     console.error('Stream error:', err.name, err.message);
-    if (!res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ type: 'text', text: 'Sorry, something went wrong. Please try again.' })}\n\n`);
-    }
+    send({ type: 'error', message: 'Something went wrong. Please try again.' });
   }
 
-  if (!res.writableEnded) {
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-    res.end();
-  }
+  if (shapesDone) await shapesDone;
+  send({ type: 'concepts_done', concepts: collected });
+  send({ type: 'done' });
+  clearInterval(ping);
+  if (!res.writableEnded) res.end();
 });
 
 /**
- * POST /api/chat (non-streaming fallback)
+ * POST /api/chat (non-streaming fallback — same pipeline, one JSON reply)
  */
 app.post('/api/chat', async (req, res) => {
+  const problem = validateChatBody(req.body);
+  if (problem) return res.status(400).json({ error: problem });
   const { message, history } = req.body;
-
-  if (!message || typeof message !== 'string') {
-    return res.status(400).json({ error: 'No message provided' });
-  }
-  if (message.length > 10000) {
-    return res.status(400).json({ error: 'Message too long' });
-  }
-  if (history && (!Array.isArray(history) || history.length > 50)) {
-    return res.status(400).json({ error: 'Invalid history' });
-  }
 
   try {
     let fullText = '';
     let visuals = [];
-
     for await (const event of chatService.createStream(message, history)) {
       if (event.type === 'text') fullText += event.text;
       if (event.type === 'visual_concepts') visuals = event.visuals;
     }
-
-    let shapes;
-    if (visuals.length > 0) {
-      shapes = await shapeService.mapConceptsToShapes(visuals);
-    } else {
-      // Fallback: build pseudo-visuals from regex-extracted concepts
-      const words = conceptService.extractConceptsFromText(message);
-      const pseudoVisuals = words.map(w => ({ iconic: w, shape: w }));
-      shapes = await shapeService.mapConceptsToShapes(pseudoVisuals);
-    }
+    const shapes = await shapeService.mapConceptsToShapes(visuals);
     res.json({ text: fullText, concepts: shapes });
   } catch (err) {
     console.error('Chat error:', err.message);
     res.status(500).json({
       text: 'Sorry, something went wrong. Please try again.',
-      concepts: [{ name: 'question', dynamic: null }],
+      concepts: [{ name: 'question', concept: 'question', dynamic: null, source: 'builtin' }],
     });
   }
 });

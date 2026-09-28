@@ -114,7 +114,11 @@ async function init() {
     state.ready = true;
     const genCount = state.nameToIdx.size - state.names.length;
     console.log(`[icon-matcher] ready (json): ${state.names.length} embedded icons + ${genCount} generated`);
-  })();
+  })().catch(err => {
+    // A failed init must not be cached forever — the next call retries.
+    state.initPromise = null;
+    throw err;
+  });
 
   return state.initPromise;
 }

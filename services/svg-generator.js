@@ -2,34 +2,33 @@
  * SVG Generator Service
  *
  * On-demand SVG generation for concepts that didn't match any library icon.
- * Calls Opus (Sonnet fallback), validates strictly, and caches to
- * public/shapes/generated-v3/{kebab}.svg.
+ * Calls Opus 5 (Sonnet 5 fallback) with low effort, validates strictly, and
+ * caches to public/shapes/generated-v3/{kebab}.svg.
  *
- * Prompt v3 (2026-04-17) — upgraded to Opus 4.7 for much better silhouette
- * quality. v2 forced Claude to enumerate iconic features before drawing and
- * added fill-rule="evenodd" for holes; v3 keeps those rules and improves
- * model quality. Cache dir bumped to `generated-v3/` on each prompt revision.
+ * Prompt v3 (2026-04-17): v2 forced Claude to enumerate iconic features
+ * before drawing and added fill-rule="evenodd" for holes; v3 kept those
+ * rules on a stronger model. Cache dir is bumped on each prompt revision.
  *
- * Strict validation rules (aligned with our Path2D.fill() rasterization pipeline):
- *   - Parses as valid XML
- *   - Has a valid viewBox
- *   - Has 2-16 <path d="..."> elements (single-path blobs rejected for
- *     multi-word concepts — blob-prevention heuristic)
- *   - No <g>, <rect>, <circle>, <polygon>, <ellipse>, <polyline>, <line>
- *   - No transforms
- *   - No stroke-only paths (stroke attrs are still rejected in v2 —
- *     rasterizer only fills; allowing strokes would render them invisible.
- *     Reintroduce with rasterizer stroke support in a future phase.)
- *   - No fill="none"
- *   - fill-rule="evenodd" is permitted (unlocks holes)
- *   - Bbox area ≥10% of viewBox
- *   - Aspect ratio within 0.3–3.0
- *   - Total path length ≥50 units (normalized to 100x100)
+ * Strict validation (aligned with the client's Path2D.fill() rasterizer):
+ *   - Parses as XML; no DOCTYPE/entities; comments ignored
+ *   - Root <svg> with a viewBox of exactly four finite numbers, w/h > 0
+ *   - Allowlist: the only elements are <svg> and <path> (no <g>, <a>, <set>,
+ *     <use>, <defs>, <mask>, <text>, <script>, <style>, <image>, …)
+ *   - Path attributes limited to d / fill / fill-rule (/ id / class); no
+ *     style, transform, opacity, stroke or event-handler attributes anywhere
+ *   - fill must be absent, currentColor, #000 or black — white/transparent
+ *     "cut-out" layers would render as solid blobs
+ *   - 1–16 paths; a single path with a single subpath is rejected as a blob
+ *   - Sampled bbox ≥10% of viewBox, aspect 0.3–3.0, path length ≥50 units,
+ *     and a filled-area proxy (per-subpath shoelace) ≥5% of the viewBox so
+ *     a few sparse dots plus a hairline can't pass on bbox alone
  *
- * Rate-limiting:
- *   - Max 1 concurrent generation (avoid API spam on fast successive messages)
- *   - Negative cache: concepts that failed validation once won't be retried
- *     this process lifetime (avoids pathological cost loops)
+ * Concurrency + cost control:
+ *   - One generation at a time; concurrent callers wait their turn and
+ *     re-check the cache before generating (a turn's three concepts resolve
+ *     in parallel — an instant-fail guard would have starved two of them)
+ *   - Negative cache: a concept that failed validation, or whose API/FS call
+ *     failed, is not retried this process lifetime
  */
 
 const fs = require('fs');
@@ -40,9 +39,9 @@ const { svgPathProperties } = require('svg-path-properties');
 
 const iconMatcher = require('./icon-matcher');
 const embeddingService = require('./embedding-service');
+const { toKebab } = require('./utils');
 
 // Prompt version — bump when prompt changes semantics so the old cache is bypassed.
-// v3: upgraded to Opus 4.7 (Sonnet 4.6 fallback) for much better silhouette quality.
 const PROMPT_VERSION = 'v3';
 const GENERATED_SUBDIR = `generated-${PROMPT_VERSION}`;
 
@@ -57,8 +56,17 @@ if (!fs.existsSync(GENERATED_DIR)) {
 
 const anthropic = new Anthropic();
 
-const PRIMARY_MODEL = 'claude-opus-4-7';
-const FALLBACK_MODEL = 'claude-sonnet-4-6';
+const PRIMARY_MODEL = 'claude-opus-5';
+const FALLBACK_MODEL = 'claude-sonnet-5';
+// Both models think adaptively when `thinking` is omitted; low effort keeps
+// the private planning step short so a generation stays in the ~10 s range.
+const REQUEST_OPTIONS = { max_tokens: 3000, output_config: { effort: 'low' } };
+// Concept kebabs become file names; cap well under filesystem limits.
+const MAX_KEBAB_CHARS = 100;
+const MAX_PATHS = 16;
+const MIN_BBOX_FRACTION = 0.10;
+const MIN_AREA_FRACTION = 0.05;
+const MIN_NORM_LENGTH = 50;
 
 // Concurrency + negative cache
 let inFlight = null;
@@ -105,13 +113,9 @@ Before drawing, silently identify the 3 most iconic visual features of this conc
 
 Output the <svg>...</svg> only.`;
 
-const { toKebab } = require('./utils');
-
 /**
  * Strip markdown fences, XML prologs, and extract the <svg> element if Claude
- * emitted a planning preamble before it. The v2 prompt tells the model to plan
- * silently, but defend against prose bleed-through: match the first
- * <svg>...</svg> and drop anything outside.
+ * emitted a planning preamble before it.
  */
 function cleanResponse(text) {
   let t = text.trim();
@@ -122,207 +126,223 @@ function cleanResponse(text) {
   return t;
 }
 
-/**
- * Strict validation — returns { ok: boolean, reason?: string, paths?: string[], viewBox?: string, detail?: number }
- */
-function validate(svgText, { iconic = '' } = {}) {
-  if (!svgText.startsWith('<svg')) {
-    return { ok: false, reason: 'does not start with <svg' };
-  }
+// ─── Validation ───
 
-  // Rule: no <g>, <rect>, <circle>, <polygon>, <ellipse>, <polyline>, <line>
-  if (/<(?:g|rect|circle|polygon|ellipse|polyline|line)\b/i.test(svgText)) {
-    return { ok: false, reason: 'non-path element present' };
-  }
-  // Rule: no transforms anywhere
-  if (/\btransform\s*=/i.test(svgText)) {
-    return { ok: false, reason: 'transform attribute present' };
-  }
-  if (/<(?:script|style|foreignObject|image|animate|animateTransform)\b/i.test(svgText)) {
-    return { ok: false, reason: 'dangerous element present' };
-  }
-  if (/\bon\w+\s*=/i.test(svgText)) {
-    return { ok: false, reason: 'event handler attribute present' };
-  }
-  // Rule: no strokes (rasterizer fills only; strokes would render invisible)
-  if (/\bstroke\s*=\s*["'](?!none\b)[^"']+["']/i.test(svgText)) {
-    return { ok: false, reason: 'stroke attribute present' };
-  }
-  // Rule: no fill="none"
-  if (/\bfill\s*=\s*["']none["']/i.test(svgText)) {
-    return { ok: false, reason: 'fill="none" present' };
-  }
+const ALLOWED_ROOT_ATTRS = /^(xmlns(:[\w-]+)?|viewbox|width|height|version|fill|id|class|xml:space)$/i;
+const ALLOWED_PATH_ATTRS = new Set(['d', 'fill', 'fill-rule', 'id', 'class']);
+const ALLOWED_FILLS = new Set(['currentcolor', '#000', '#000000', 'black']);
 
-  let doc;
-  try {
-    // @xmldom/xmldom ≥0.9 replaced the `errorHandler` object with a single
-    // `onError(level, msg, ctx)` callback. The old option is a hard error —
-    // which would silently break the entire on-demand generation tier and
-    // send every novel concept to the builtin "question mark" fallback.
-    doc = new DOMParser({
-      onError: (level, msg) => { if (level === 'fatalError') throw new Error(msg); },
-    }).parseFromString(svgText, 'image/svg+xml');
-  } catch (e) {
-    return { ok: false, reason: 'xml parse failure: ' + e.message };
+function localName(el) {
+  return String(el.localName || el.tagName || '').split(':').pop().toLowerCase();
+}
+
+function parseViewBox(value) {
+  const parts = String(value || '').trim().split(/[\s,]+/).map(Number);
+  if (parts.length !== 4 || parts.some(n => !Number.isFinite(n)) || parts[2] <= 0 || parts[3] <= 0) return null;
+  return parts;
+}
+
+/** Absolute shoelace area of a closed polygon given as [{x,y}]. */
+function polygonArea(poly) {
+  let a = 0;
+  for (let i = 0, n = poly.length; i < n; i++) {
+    const p = poly[i];
+    const q = poly[(i + 1) % n];
+    a += p.x * q.y - q.x * p.y;
   }
-
-  const svgEl = doc.documentElement;
-  if (!svgEl || svgEl.tagName.toLowerCase() !== 'svg') {
-    return { ok: false, reason: 'no <svg> root' };
-  }
-
-  const viewBox = svgEl.getAttribute('viewBox');
-  if (!viewBox || !/^[\d.\-\s]+$/.test(viewBox)) {
-    return { ok: false, reason: 'missing or malformed viewBox' };
-  }
-
-  const pathEls = svgEl.getElementsByTagName('path');
-  if (pathEls.length === 0) {
-    return { ok: false, reason: 'no <path> elements' };
-  }
-  // v2: path cap raised 8 → 16 to allow more articulated silhouettes.
-  if (pathEls.length > 16) {
-    return { ok: false, reason: `too many paths (${pathEls.length})` };
-  }
-
-  const paths = [];
-  for (let i = 0; i < pathEls.length; i++) {
-    const d = pathEls[i].getAttribute('d');
-    if (!d) return { ok: false, reason: 'path missing d attribute' };
-    paths.push(d);
-  }
-
-  // Detail-floor gate (v2): for multi-word concepts, reject blob-like SVGs that
-  // have only one path AND only one subpath-start. The user's Pisa and Colosseum
-  // failures were exactly this case — single <path> with a single M command
-  // describing a convex bounding shape. This heuristic catches them before they
-  // ever reach the canvas.
-  const isMultiWord = iconic.trim().split(/\s+/).length > 1;
-  if (isMultiWord) {
-    let totalSubpathStarts = 0;
-    for (const d of paths) {
-      // Count M/m commands (subpath starts) in the d attribute.
-      const matches = d.match(/[Mm]/g);
-      if (matches) totalSubpathStarts += matches.length;
-    }
-    if (paths.length === 1 && totalSubpathStarts < 2) {
-      return { ok: false, reason: `single-path single-subpath blob (subpath starts: ${totalSubpathStarts})` };
-    }
-  }
-
-  // Path length & bbox check — reject overly-thin shapes or degenerate paths
-  const [, , vw, vh] = viewBox.split(/\s+/).map(Number);
-  const viewboxArea = vw * vh;
-
-  let totalLength = 0;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  const SAMPLES_PER_PATH = 100;
-
-  try {
-    for (const d of paths) {
-      const props = new svgPathProperties(d);
-      const len = props.getTotalLength();
-      totalLength += len;
-
-      // Sample along the path to compute bounding box
-      for (let i = 0; i <= SAMPLES_PER_PATH; i++) {
-        const t = (len * i) / SAMPLES_PER_PATH;
-        const pt = props.getPointAtLength(t);
-        if (pt.x < minX) minX = pt.x;
-        if (pt.y < minY) minY = pt.y;
-        if (pt.x > maxX) maxX = pt.x;
-        if (pt.y > maxY) maxY = pt.y;
-      }
-    }
-  } catch (e) {
-    return { ok: false, reason: 'path sampling failed: ' + e.message };
-  }
-
-  // Reasonable shape coverage — bbox should be at least 10% of viewBox area
-  const bboxW = maxX - minX;
-  const bboxH = maxY - minY;
-  const bboxArea = bboxW * bboxH;
-  if (bboxArea / viewboxArea < 0.10) {
-    return { ok: false, reason: `bbox too small (${(bboxArea / viewboxArea * 100).toFixed(1)}% of viewBox)` };
-  }
-  if (bboxW <= 0 || bboxH <= 0) {
-    return { ok: false, reason: 'degenerate bbox' };
-  }
-
-  // Aspect ratio check
-  const aspect = bboxW / bboxH;
-  if (aspect < 0.3 || aspect > 3.0) {
-    return { ok: false, reason: `aspect ratio out of range (${aspect.toFixed(2)})` };
-  }
-
-  // Total path length proxy for visual detail — at least 50 units for a 100×100 viewBox
-  const normLength = totalLength * (100 / Math.max(vw, vh));
-  if (normLength < 50) {
-    return { ok: false, reason: `too little detail (path length ${normLength.toFixed(1)})` };
-  }
-
-  return { ok: true, paths, viewBox, detail: normLength, pathCount: paths.length };
+  return Math.abs(a) / 2;
 }
 
 /**
- * Generate an SVG for the given iconic concept. Returns:
- *   { ok: true, name: "kebab-name", url: "/shapes/generated-v3/…svg", detail }
- *   { ok: false, reason: "…" }
- *   null  (if rate-limited or otherwise skipped)
- *
- * Safe to call repeatedly — caching + negative-cache prevent runaway cost.
+ * Strict validation — returns
+ *   { ok: true, paths, viewBox, detail, pathCount, areaFraction } or
+ *   { ok: false, reason }
  */
-async function generate(iconic) {
-  const kebab = toKebab(iconic);
-  if (!kebab) return { ok: false, reason: 'empty iconic' };
+function validate(svgText, { iconic = '' } = {}) {
+  const fail = (reason) => ({ ok: false, reason });
 
-  // Already cached?
+  if (typeof svgText !== 'string' || !svgText.startsWith('<svg')) return fail('does not start with <svg');
+  if (/<!DOCTYPE|<!ENTITY/i.test(svgText)) return fail('doctype/entity present');
+  const stripped = svgText.replace(/<!--[\s\S]*?-->/g, '');
+
+  let doc;
+  try {
+    // @xmldom/xmldom ≥0.9 uses a single `onError(level, msg)` callback.
+    doc = new DOMParser({
+      onError: (level, msg) => { if (level === 'fatalError') throw new Error(msg); },
+    }).parseFromString(stripped, 'image/svg+xml');
+  } catch (e) {
+    return fail('xml parse failure: ' + e.message);
+  }
+
+  const svgEl = doc.documentElement;
+  if (!svgEl || localName(svgEl) !== 'svg') return fail('no <svg> root');
+
+  const viewBox = parseViewBox(svgEl.getAttribute('viewBox'));
+  if (!viewBox) return fail('missing or malformed viewBox (need 4 finite numbers, w/h > 0)');
+  const [, , vw, vh] = viewBox;
+
+  for (let i = 0; i < svgEl.attributes.length; i++) {
+    const name = svgEl.attributes[i].name;
+    if (/^on/i.test(name) || !ALLOWED_ROOT_ATTRS.test(name)) return fail(`root attribute not allowed: ${name}`);
+  }
+
+  const paths = [];
+  for (let node = svgEl.firstChild; node; node = node.nextSibling) {
+    if (node.nodeType === 3 || node.nodeType === 4) {
+      if (node.nodeValue.trim()) return fail('stray text content');
+      continue;
+    }
+    if (node.nodeType !== 1) continue;
+    const tag = localName(node);
+    if (tag !== 'path') return fail(`element not allowed: <${tag}>`);
+    for (let i = 0; i < node.attributes.length; i++) {
+      const name = node.attributes[i].name.toLowerCase();
+      if (!ALLOWED_PATH_ATTRS.has(name)) return fail(`path attribute not allowed: ${name}`);
+    }
+    const fill = node.getAttribute('fill');
+    if (fill != null && !ALLOWED_FILLS.has(fill.trim().toLowerCase())) return fail(`non-black fill: ${fill}`);
+    const rule = node.getAttribute('fill-rule');
+    if (rule != null && !/^(nonzero|evenodd)$/i.test(rule.trim())) return fail(`bad fill-rule: ${rule}`);
+    const d = node.getAttribute('d');
+    if (!d || !d.trim()) return fail('path missing d attribute');
+    paths.push(d.trim());
+  }
+
+  if (paths.length === 0) return fail('no <path> elements');
+  if (paths.length > MAX_PATHS) return fail(`too many paths (${paths.length})`);
+
+  // Detail-floor gate: a single <path> with a single subpath is a convex
+  // blob describing a bounding shape, not an icon — for any concept.
+  if (paths.length === 1 && (paths[0].match(/[Mm]/g) || []).length < 2) {
+    return fail('single-path single-subpath blob');
+  }
+
+  // Geometry: sample every segment of every path to get the total length,
+  // the bounding box, and a filled-area proxy (per-subpath shoelace area).
+  let totalLength = 0;
+  let filledArea = 0;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  try {
+    for (const d of paths) {
+      const props = new svgPathProperties(d);
+      const parts = props.getParts();
+      let offset = 0;
+      let poly = [];
+      let prevEnd = null;
+      const flush = () => { if (poly.length >= 3) filledArea += polygonArea(poly); poly = []; };
+      for (const part of parts) {
+        const len = part.length;
+        const moved = prevEnd && (Math.abs(part.start.x - prevEnd.x) > 1e-6 || Math.abs(part.start.y - prevEnd.y) > 1e-6);
+        if (moved) flush();
+        const samples = Math.min(40, Math.max(2, Math.ceil(len / 2)));
+        for (let i = poly.length ? 1 : 0; i <= samples; i++) {
+          const pt = props.getPointAtLength(offset + (len * i) / samples);
+          if (pt.x < minX) minX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y > maxY) maxY = pt.y;
+          poly.push(pt);
+        }
+        offset += len;
+        prevEnd = part.end;
+      }
+      flush();
+      totalLength += props.getTotalLength();
+    }
+  } catch (e) {
+    return fail('path sampling failed: ' + e.message);
+  }
+
+  const bboxW = maxX - minX;
+  const bboxH = maxY - minY;
+  if (!(bboxW > 0) || !(bboxH > 0)) return fail('degenerate bbox');
+  const viewboxArea = vw * vh;
+  const bboxFraction = (bboxW * bboxH) / viewboxArea;
+  if (bboxFraction < MIN_BBOX_FRACTION) return fail(`bbox too small (${(bboxFraction * 100).toFixed(1)}% of viewBox)`);
+
+  const aspect = bboxW / bboxH;
+  if (aspect < 0.3 || aspect > 3.0) return fail(`aspect ratio out of range (${aspect.toFixed(2)})`);
+
+  const normLength = totalLength * (100 / Math.max(vw, vh));
+  if (normLength < MIN_NORM_LENGTH) return fail(`too little detail (path length ${normLength.toFixed(1)})`);
+
+  const areaFraction = filledArea / viewboxArea;
+  if (areaFraction < MIN_AREA_FRACTION) return fail(`too little filled area (${(areaFraction * 100).toFixed(1)}% of viewBox)`);
+
+  return { ok: true, paths, viewBox: viewBox.join(' '), detail: normLength, pathCount: paths.length, areaFraction };
+}
+
+// ─── Generation ───
+
+function cachedResult(kebab) {
   const outPath = path.join(GENERATED_DIR, `${kebab}.svg`);
   if (fs.existsSync(outPath)) {
     return { ok: true, name: kebab, url: `${GENERATED_URL_PREFIX}/${kebab}.svg`, cached: true };
   }
-
-  // Known failure?
   if (failedCache.has(kebab)) {
-    return { ok: false, reason: 'previously failed validation (negative cache)' };
+    return { ok: false, reason: 'previously failed (negative cache)' };
   }
+  return null;
+}
 
-  // Already in-flight globally? Skip to avoid stacked requests.
-  if (inFlight) {
-    return { ok: false, reason: 'another generation in progress' };
+async function callModel(iconic) {
+  const reqParams = {
+    ...REQUEST_OPTIONS,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: USER_PROMPT_TEMPLATE(iconic) }],
+  };
+  try {
+    return await anthropic.messages.create({ model: PRIMARY_MODEL, ...reqParams });
+  } catch (primaryErr) {
+    console.warn(`[svg-gen] ${PRIMARY_MODEL} failed, falling back to ${FALLBACK_MODEL}:`, primaryErr.message);
+    return anthropic.messages.create({ model: FALLBACK_MODEL, ...reqParams });
   }
+}
+
+/**
+ * Generate an SVG for the given iconic concept. Returns:
+ *   { ok: true, name, url, detail?, cached? }
+ *   { ok: false, reason }
+ *
+ * Safe to call concurrently — callers serialize on a single in-flight slot
+ * and re-check the caches after waiting.
+ */
+async function generate(iconic) {
+  const kebab = toKebab(iconic).slice(0, MAX_KEBAB_CHARS);
+  if (!kebab) return { ok: false, reason: 'empty iconic' };
+
+  const early = cachedResult(kebab);
+  if (early) return early;
+
+  while (inFlight) {
+    await inFlight.catch(() => {});
+  }
+  const afterWait = cachedResult(kebab);
+  if (afterWait) return afterWait;
 
   inFlight = (async () => {
     try {
-      let resp;
-      const reqParams = {
-        max_tokens: 3000,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: USER_PROMPT_TEMPLATE(iconic) }],
-      };
-      try {
-        resp = await anthropic.messages.create({ model: PRIMARY_MODEL, ...reqParams });
-      } catch (primaryErr) {
-        console.warn(`[svg-gen] ${PRIMARY_MODEL} failed, falling back to ${FALLBACK_MODEL}:`, primaryErr.message);
-        resp = await anthropic.messages.create({ model: FALLBACK_MODEL, ...reqParams });
+      const resp = await callModel(iconic);
+      // With adaptive thinking the first block can be a thinking block.
+      const raw = resp.content.find(b => b.type === 'text')?.text;
+      if (!raw) {
+        failedCache.add(kebab);
+        return { ok: false, reason: 'empty response' };
       }
-
-      const raw = resp.content[0]?.text;
-      if (!raw) return { ok: false, reason: 'empty response' };
 
       const svg = cleanResponse(raw);
       const check = validate(svg, { iconic });
-
       if (!check.ok) {
         failedCache.add(kebab);
         console.warn(`[svg-gen] rejected "${iconic}" — ${check.reason}`);
         return { ok: false, reason: check.reason };
       }
 
-      // Write to disk
+      const outPath = path.join(GENERATED_DIR, `${kebab}.svg`);
       fs.writeFileSync(outPath, svg, 'utf-8');
 
-      // Register with matcher, embedding so future variants can find it
+      // Register with the matcher so future variants can find it.
       let embedding = null;
       try {
         embedding = await embeddingService.embed(iconic);
@@ -331,11 +351,14 @@ async function generate(iconic) {
       }
       await iconMatcher.registerGenerated(kebab, iconic, embedding);
 
-      console.log(`[svg-gen] accepted "${iconic}" → ${GENERATED_SUBDIR}/${kebab}.svg (paths ${check.pathCount}, detail ${check.detail.toFixed(0)})`);
+      console.log(`[svg-gen] accepted "${iconic}" → ${GENERATED_SUBDIR}/${kebab}.svg (paths ${check.pathCount}, detail ${check.detail.toFixed(0)}, area ${(check.areaFraction * 100).toFixed(0)}%)`);
       return { ok: true, name: kebab, url: `${GENERATED_URL_PREFIX}/${kebab}.svg`, detail: check.detail };
     } catch (err) {
+      // API or filesystem failure: don't re-spend on this concept this
+      // process lifetime.
+      failedCache.add(kebab);
       console.warn(`[svg-gen] error generating "${iconic}":`, err.message);
-      return { ok: false, reason: 'api error: ' + err.message };
+      return { ok: false, reason: 'generation error: ' + err.message };
     } finally {
       inFlight = null;
     }
