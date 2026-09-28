@@ -6,7 +6,8 @@
  *
  * Resolution order:
  *   1. Exact kebab match         ("top hat" → "top-hat.svg" if present)
- *   2. Cosine embedding match    (MiniLM-L6-v2, threshold 0.55)
+ *   2. Cosine embedding match    (MiniLM-L6-v2; threshold set by the caller —
+ *                                 shape-service.js uses EMBEDDING_THRESHOLD 0.60)
  *   3. null                      (caller handles fallback)
  *
  * Runtime-registered icons (from svg-generator) are appended to the in-memory

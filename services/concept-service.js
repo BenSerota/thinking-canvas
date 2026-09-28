@@ -31,7 +31,7 @@ const CONCEPT_KEYWORDS = {
   food: /\b(foods?|cook(?:ing)?|recipes?|restaurants?|eat(?:ing)?|dinners?|lunch(?:es)?|meals?|breakfast)\b/i,
   cup: /\b(coffee|tea|drinks?|cups?|beverages?)\b/i,
   person: /\b(person|people|friends?|famil(?:y|ies)|humans?|someone)\b/i,
-  star: /\b(stars?|space|universe|galax(?:y|ies)|night|amazing|great)\b/i,
+  star: /\b(stars?|space|universe|galax(?:y|ies))\b/i,
   heart: /\b(hearts?|love|loving|romantic|romance)\b/i,
   money: /\b(money|cash|dollars?|budget|financ(?:e|ial)|pay(?:ment)?|cost|price)\b/i,
   key: /\b(keys?|lock|unlock|password|secur(?:e|ity))\b/i,

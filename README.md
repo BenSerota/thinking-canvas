@@ -5,9 +5,9 @@ An AI chat interface where 12,000 sand-grain particles form shapes that visualiz
 ## How It Works
 
 1. You send a message in the chat panel
-2. Claude responds with extended thinking, which triggers a visual concept extractor (Haiku) to identify key ideas
-3. Each concept is resolved to a shape through a multi-tier pipeline: Lottie animations, curated icons, OpenMoji emoji, Iconify web icons, local library matching, or on-demand SVG generation
-4. Particles flow from a hurricane formation into the resolved shape, then cycle through concepts before arranging on a carousel
+2. Claude (Sonnet 5, adaptive thinking) starts replying while, in parallel from t=0, a visual concept extractor (Haiku 4.5) turns your message plus the recent conversation into three iconic objects
+3. Each concept is resolved to a shape through a multi-tier pipeline: curated icons, exact library matches, bundled Lottie animations, OpenMoji emoji, Iconify web icons, local library matching, or on-demand SVG generation — the three resolve concurrently and stream to the canvas as they land
+4. Particles flow from a hurricane formation into each resolved shape, then cycle through concepts before arranging on a carousel
 
 ## Setup
 
@@ -61,14 +61,16 @@ Concepts are resolved in priority order:
 
 | Tier | Source | Speed | Coverage |
 |------|--------|-------|----------|
-| 0 | Lottie animations (bundled + API) | Instant / ~500ms | 8 bundled, unlimited via API |
-| 0.5 | Curated icon overrides | Instant | ~20 hand-picked |
-| 0.7 | Library exact match | Instant | ~5,500 icons |
-| 1 | OpenMoji emoji | ~50ms | ~2,400 line-art SVGs |
-| 2 | Iconify web search | ~200-500ms | ~200,000 icons |
-| 3 | Library embedding match | ~100ms | ~5,500 icons |
-| 3b | On-demand SVG generation (Opus) | ~3-5s | Unlimited |
-| 4 | Built-in fallback shapes | Instant | 30 basic shapes |
+| 1 | Curated icon overrides | Instant | ~140 hand-picked concepts |
+| 2 | Library exact match | Instant | ~5,500 icons |
+| 3 | Bundled Lottie animations | Instant | 8 animations, whole-word tag match |
+| 4 | OpenMoji emoji | ~50ms | ~2,400 line-art SVGs |
+| 5 | Iconify web search | ~200-500ms (cached after) | ~200,000 icons |
+| 6 | Library embedding match | ~100ms | ~5,500 icons |
+| 7 | On-demand SVG generation (Opus 5) | ~10s, once per concept | Unlimited |
+| 8 | Built-in fallback shapes | Instant | 30 basic shapes |
+
+Each concept gets a 20 s budget; the three concepts of a turn resolve in parallel and never block the reply text.
 
 ## Project Structure
 

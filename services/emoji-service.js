@@ -13,16 +13,15 @@
  * emoji's `annotation + tags` embedding (pre-built by
  * scripts/build-emoji-embeddings.js into data/emoji-embeddings.json).
  *
- * Pipeline position: runs AFTER curated overrides (0) and AFTER the online
- * Iconify search (1) but BEFORE the local library embedding match (2). See
- * the numbered resolution ladder in shape-service.js resolveVisual. The
- * rationale:
- *   - Iconify first keeps per-concept UI-icon precision (e.g. "laptop",
- *     "trash can", "arrow up") that the emoji catalog would fuzzy-match.
- *   - Emoji next, because for "vibes" concepts (wild hair, DNA, sound wave)
- *     the hand-drawn line art is the best silhouette we have.
- *   - Library matcher after, as a general fallback for concepts where
- *     neither Iconify nor emoji hit with confidence.
+ * Pipeline position: tier 4 in shape-service.js resolveVisual — after the
+ * curated, exact-library and bundled-Lottie tiers, BEFORE the online
+ * Iconify search and the local library embedding match. The rationale:
+ *   - Exact/curated icons first: a precise hit must beat a fuzzy one.
+ *   - Emoji before Iconify, because for "vibes" concepts (wild hair, DNA,
+ *     sound wave) the hand-drawn line art is the best silhouette we have,
+ *     and the noun-overlap gate keeps its fuzziness honest.
+ *   - Iconify and the library matcher after, as general fallbacks for
+ *     concepts the emoji catalog doesn't cover with confidence.
  *
  * License: OpenMoji is CC-BY-SA 4.0. Attribution is included in
  * data/emoji-catalog.json and must be preserved in downstream distribution.
@@ -38,9 +37,10 @@ const INDEX_PATH = path.join(ROOT, 'data', 'emoji-embeddings.index.json');
 const VECTORS_PATH = path.join(ROOT, 'data', 'emoji-embeddings.f32');
 const SVG_DIR_URL = '/shapes/emoji';
 
-// Threshold chosen to mirror icon-matcher.js (0.55). We can tune after
-// live data — a lower threshold means more emoji hits but potentially
-// worse specificity. Keep conservative until we see failure patterns.
+// Emoji tier threshold. (The library matcher runs at 0.60 — see
+// shape-service.js EMBEDDING_THRESHOLD — but its candidates have no
+// noun-overlap gate, so it needs the stricter cut.) A lower threshold
+// means more emoji hits but potentially worse specificity.
 const DEFAULT_THRESHOLD = 0.55;
 
 const embeddingService = require('./embedding-service');
