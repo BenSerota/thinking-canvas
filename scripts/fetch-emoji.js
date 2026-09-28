@@ -23,16 +23,19 @@
  *   metadata recorded below documents what each file contains.
  *
  * Idempotent: checks `data/emoji-catalog.json` ↔ release tag; skips work if
- * already up to date. Delete the catalog file to force a re-fetch.
+ * already up to date — before any network call. Delete the catalog file to
+ * force a re-fetch.
  *
- * Requires the system `unzip` (macOS/Linux: pre-installed; Windows: WSL or
- * install via choco/winget) — we avoid pulling in a pure-JS zip dep.
+ * The release is pinned (DEFAULT_TAG) so builds are reproducible and need
+ * no GitHub API call. `OPENMOJI_TAG=latest` discovers the newest release
+ * through the API (set GITHUB_TOKEN to lift the 60 req/h anonymous limit).
+ * The zip is extracted with adm-zip — no system `unzip` dependency.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const os = require('os');
+const AdmZip = require('adm-zip');
 const { DOMParser } = require('@xmldom/xmldom');
 
 const GEOM_TAGS = new Set(['path', 'line', 'polyline', 'polygon', 'circle', 'ellipse', 'rect']);
@@ -78,65 +81,73 @@ const OUT_DIR = path.join(ROOT, 'public', 'shapes', 'emoji');
 const CATALOG_PATH = path.join(ROOT, 'data', 'emoji-catalog.json');
 
 const RELEASE_API = 'https://api.github.com/repos/hfg-gmuend/openmoji/releases/latest';
-const METADATA_URL = 'https://raw.githubusercontent.com/hfg-gmuend/openmoji/master/data/openmoji.json';
+// Pinned OpenMoji release. Bump deliberately; `OPENMOJI_TAG=latest` asks the
+// GitHub API for the newest one instead.
+const DEFAULT_TAG = '16.0.0';
 // The default asset name from OpenMoji releases.
 const ASSET_NAME = 'openmoji-svg-black.zip';
+const assetUrl = (tag) => `https://github.com/hfg-gmuend/openmoji/releases/download/${tag}/${ASSET_NAME}`;
+const metadataUrl = (tag) => `https://raw.githubusercontent.com/hfg-gmuend/openmoji/${tag}/data/openmoji.json`;
 
-async function fetchJson(url, opts = {}) {
-  const res = await fetch(url, { headers: { 'user-agent': 'thinking-canvas/fetch-emoji', ...(opts.headers || {}) } });
+function githubHeaders() {
+  const headers = { 'user-agent': 'thinking-canvas/fetch-emoji' };
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  return headers;
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: githubHeaders() });
   if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`);
   return res.json();
 }
 
 async function fetchBuffer(url) {
-  const res = await fetch(url, { headers: { 'user-agent': 'thinking-canvas/fetch-emoji' } });
+  const res = await fetch(url, { headers: githubHeaders() });
   if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+/** True when the catalog already matches `tag` and the SVGs are on disk. */
+function isUpToDate(tag) {
+  if (!fs.existsSync(CATALOG_PATH)) return false;
+  try {
+    const existing = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf-8'));
+    if (existing.releaseTag !== tag || !existing.emoji || existing.emoji.length === 0) return false;
+    const svgCount = fs.readdirSync(OUT_DIR).filter(f => f.endsWith('.svg')).length;
+    if (svgCount < existing.emoji.length * 0.95) return false;
+    console.log(`[fetch-emoji] up to date — ${existing.emoji.length} emoji catalogued against release ${tag}, ${svgCount} SVGs on disk.`);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function main() {
   if (!fs.existsSync(path.join(ROOT, 'data'))) fs.mkdirSync(path.join(ROOT, 'data'), { recursive: true });
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  // 1) Find the latest release + the specific zip asset we want.
-  console.log('[fetch-emoji] querying latest OpenMoji release...');
-  const release = await fetchJson(RELEASE_API);
-  const tag = release.tag_name;
-  const asset = (release.assets || []).find(a => a.name === ASSET_NAME);
-  if (!asset) throw new Error(`No asset named ${ASSET_NAME} in release ${tag}`);
-
-  // Skip if we already have a catalog matching this tag.
-  if (fs.existsSync(CATALOG_PATH)) {
-    try {
-      const existing = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf-8'));
-      if (existing.releaseTag === tag && existing.emoji && existing.emoji.length > 0) {
-        const svgCount = fs.readdirSync(OUT_DIR).filter(f => f.endsWith('.svg')).length;
-        if (svgCount >= existing.emoji.length * 0.95) {
-          console.log(`[fetch-emoji] up to date — ${existing.emoji.length} emoji catalogued against release ${tag}, ${svgCount} SVGs on disk.`);
-          return;
-        }
-      }
-    } catch (_) { /* fall through to rebuild */ }
+  // 1) Resolve the release tag. The pinned default needs no API call at all.
+  let tag = process.env.OPENMOJI_TAG || DEFAULT_TAG;
+  if (tag !== 'latest' && isUpToDate(tag)) return;
+  if (tag === 'latest') {
+    console.log('[fetch-emoji] querying latest OpenMoji release...');
+    const release = await fetchJson(RELEASE_API);
+    tag = release.tag_name;
+    if (isUpToDate(tag)) return;
   }
 
-  // 2) Fetch metadata (annotations, tags, groups).
-  console.log('[fetch-emoji] fetching openmoji.json metadata...');
-  const rawCatalog = await fetchJson(METADATA_URL);
+  // 2) Fetch metadata (annotations, tags, groups) for exactly this release.
+  console.log(`[fetch-emoji] fetching openmoji.json metadata for ${tag}...`);
+  const rawCatalog = await fetchJson(metadataUrl(tag));
   console.log(`[fetch-emoji]   ${rawCatalog.length} raw entries`);
 
   // 3) Download the SVG zip & extract to a staging tmp dir, then copy into OUT_DIR.
-  console.log(`[fetch-emoji] downloading ${ASSET_NAME} (~${Math.round(asset.size / 1024 / 1024)} MB)...`);
-  const zipBuf = await fetchBuffer(asset.browser_download_url);
+  console.log(`[fetch-emoji] downloading ${ASSET_NAME} for ${tag}...`);
+  const zipBuf = await fetchBuffer(assetUrl(tag));
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openmoji-'));
-  const zipPath = path.join(tmpDir, ASSET_NAME);
-  fs.writeFileSync(zipPath, zipBuf);
-  console.log(`[fetch-emoji] unzipping to ${tmpDir}...`);
-  try {
-    execFileSync('unzip', ['-q', '-o', zipPath, '-d', tmpDir], { stdio: 'inherit' });
-  } catch (e) {
-    throw new Error(`unzip failed — install the system 'unzip' utility: ${e.message}`);
-  }
+  console.log(`[fetch-emoji] extracting ${Math.round(zipBuf.length / 1024 / 1024)} MB to ${tmpDir}...`);
+  new AdmZip(zipBuf).extractAllTo(tmpDir, true);
 
   // The zip extracts to a `black/svg/` subdir (or directly into tmpDir on
   // some builds). Find the directory containing hex-named SVGs.

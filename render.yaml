@@ -3,11 +3,13 @@ services:
     name: thinking-canvas
     runtime: node
     plan: free
-    # --include=dev: Render sets NODE_ENV=production, which makes `npm install`
-    # skip devDependencies. The icon packages (@fortawesome, @material-symbols)
+    # npm ci: reproducible install from the committed package-lock.json.
+    # --include=dev: Render sets NODE_ENV=production, which makes npm skip
+    # devDependencies. The icon packages (@fortawesome, @material-symbols)
     # live in devDeps because they're only read at build time by the fetch
     # scripts — so we must force them in here, otherwise setup-icons fails.
-    buildCommand: npm install --include=dev && npm run setup-icons && npm run setup-emoji
+    # setup-emoji uses the pinned OpenMoji release (no GitHub API call).
+    buildCommand: npm ci --include=dev && npm run setup-icons && npm run setup-emoji
     startCommand: npm start
     healthCheckPath: /
     envVars:
