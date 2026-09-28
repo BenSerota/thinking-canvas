@@ -441,35 +441,29 @@ function countLargeComponents(mask, W, H, minSize = 500) {
  *   - Boosted R ≈ 5% when the raw mask has ≥ 2 large connected components
  *     (basketball's 8 wedges, brain's hemispheres) — closes ~30px seams.
  *
- * This keeps single-component icons untouched while aggressively merging
- * inherently multi-part icons into coherent silhouettes.
- *
  * `shapeSource` gates the closing step:
- *   - 'library' (default): full closing as described above — needed because
- *     FA/MS icons and some built-ins (basketball seams, envelope flap)
- *     express decorative detail as separate subpaths that need bridging.
- *   - 'generated': skip closing entirely. The SVG generator's v2 prompt uses
+ *   - 'library' (default): full closing as described above.
+ *   - 'generated': skip closing entirely. Generated SVGs use
  *     fill-rule="evenodd" for intentional holes (arch openings, brain sulci);
- *     morphological closing would seal them back into blobs. Generated SVGs
- *     already come out as coherent single-component silhouettes.
+ *     morphological closing would seal them back into blobs.
  *
- * Path fills use fill-rule="evenodd" so holes carved by reversed subpaths
- * render as holes (nonzero would fill them solid). This is essential for
- * v2-generated SVGs.
+ * `paths` entries are `d` strings or `{ d, fillRule }` objects. Library and
+ * builtin paths fill with `nonzero` (what they were authored for) unless the
+ * SVG says `evenodd`; generated paths default to `evenodd`.
  *
- * Edge pixels are duplicated 3x so more particles cluster on outlines.
+ * Solid silhouettes — edge pixels < 12% of filled pixels — render as
+ * outlines. That decision is made from pixel counts on the 300 px mask
+ * before any point object exists; only then, if outlines are wanted, is
+ * the mask re-rendered once at 600 px for particle density. Nothing is
+ * rasterized into point objects twice.
+ *
+ * Edge pixels are tripled so more particles cluster on outlines.
  */
-function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library', maxPoints = 30000) {
+function buildFillMask(paths, viewBox, resolution, shapeSource) {
   // Render into a canvas that extends past the declared viewBox. Some SVGs
   // have path points outside their viewBox (LLM-generated ones most often);
-  // a rigid viewBox-sized canvas clips that content. The pad captures
-  // overflow; actual-content normalization below makes the final coords
-  // honest. `generated` gets a larger buffer because the LLM occasionally
-  // emits viewBox-overflowing strokes; library/emoji/iconify SVGs are
-  // well-formed, so a small safety pad is enough and keeps the raster
-  // bitmap ≈ (1.3×resolution)² — the pad was previously 3× which made
-  // the bitmap 9× larger and pushed the morphological closing pass into
-  // a multi-second main-thread block on first shape render.
+  // the pad captures overflow and the bbox normalization below keeps the
+  // final coords honest.
   const OVERFLOW_PAD = shapeSource === 'generated' ? 0.5 : 0.15;
   const padPx = Math.round(resolution * OVERFLOW_PAD);
   const W = resolution + padPx * 2;
@@ -480,7 +474,7 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   canvas.height = H;
   const ctx = canvas.getContext('2d');
 
-  const [vx, vy, vw, vh] = viewBox.split(' ').map(Number);
+  const [vx, vy, vw, vh] = viewBox.split(/[\s,]+/).map(Number);
   const scaleX = resolution / vw;
   const scaleY = resolution / vh;
 
@@ -489,48 +483,40 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
   ctx.scale(scaleX, scaleY);
   ctx.translate(-vx, -vy);
 
-  for (const pathStr of paths) {
-    const path = new Path2D(pathStr);
-    ctx.fill(path, 'evenodd');
+  const defaultRule = shapeSource === 'generated' ? 'evenodd' : 'nonzero';
+  for (const entry of paths) {
+    const d = typeof entry === 'string' ? entry : entry && entry.d;
+    if (!d) continue;
+    const rule = entry && typeof entry === 'object' && entry.fillRule === 'evenodd' ? 'evenodd' : defaultRule;
+    ctx.fill(new Path2D(d), rule);
   }
 
-  // Extract filled pixel positions at 1px resolution
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  const imageData = ctx.getImageData(0, 0, W, H);
-  const data = imageData.data;
-  const points = [];
+  const data = ctx.getImageData(0, 0, W, H).data;
 
-  // First pass: build raw mask + compute bounding box
   const raw = new Uint8Array(W * H);
   let minX = W, maxX = -1, minY = H, maxY = -1;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = (y * W + x) * 4;
-      if (data[i + 3] > 128) {
-        raw[y * W + x] = 1;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
+  for (let i = 0, n = W * H; i < n; i++) {
+    if (data[i * 4 + 3] > 128) {
+      raw[i] = 1;
+      const x = i % W;
+      const y = (i - x) / W;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
     }
   }
 
   // Morphological closing to fill decorative gaps between subpaths.
-  // Use connected-components count to decide the closing radius:
   //   1 large island → light closing (2.5% of bbDim) — just smooth small seams
   //   2+ large islands → aggressive closing (5% of bbDim) — bridge the islands
-  // The CC count is cheap (single 4-connectivity flood-fill pass) and lets us
-  // avoid over-closing icons like `envelope` (flap is a separate island but
-  // it's intentional visual detail).
-  //
-  // SKIPPED for generated and builtin sources — their SVGs are authored as
-  // coherent single-component silhouettes with intentional holes (evenodd).
-  // Closing would seal those holes (Colosseum arches, brain sulcus) into blobs.
+  // The island threshold scales with the raster so both passes agree.
   let filled = raw;
   if (shapeSource === 'library' && maxX >= minX && maxY >= minY) {
     const bbDim = Math.max(1, Math.min(maxX - minX, maxY - minY));
-    const components = countLargeComponents(raw, W, H);
+    const minIsland = Math.round(500 * (resolution / 300) * (resolution / 300));
+    const components = countLargeComponents(raw, W, H, minIsland);
     const fraction = components >= 2 ? 0.05 : 0.025;
     const R = Math.max(0, Math.round(bbDim * fraction));
     if (R >= 2) {
@@ -538,97 +524,102 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
     }
   }
 
-  // Normalize against the actual filled bbox, but use the SAME denominator for
-  // both axes so aspect ratio is preserved in the point cloud. Downstream
-  // _buildShape recomputes bbox from points and applies a single uniform scale,
-  // so the shorter axis naturally ends up with a smaller [0, <1] range. This
-  // matches the pre-fix behavior for in-viewBox shapes (where normalization
-  // was `/resolution`) while correctly handling shapes that overflow their
-  // declared viewBox.
-  if (maxX < minX || maxY < minY) return points;  // empty shape
-  const bboxW = maxX - minX + 1;
-  const bboxH = maxY - minY + 1;
+  return { filled, W, H, minX, maxX, minY, maxY };
+}
+
+function isEdgePixel(mask, W, H, x, y) {
+  return x === 0 || x === W - 1 || y === 0 || y === H - 1 ||
+    !mask[(y - 1) * W + x] ||
+    !mask[(y + 1) * W + x] ||
+    !mask[y * W + (x - 1)] ||
+    !mask[y * W + (x + 1)];
+}
+
+/** Filled / edge pixel counts inside the mask's bbox — no allocation. */
+function maskStats(m) {
+  let fill = 0, edge = 0;
+  for (let y = m.minY; y <= m.maxY; y++) {
+    for (let x = m.minX; x <= m.maxX; x++) {
+      if (!m.filled[y * m.W + x]) continue;
+      fill++;
+      if (isEdgePixel(m.filled, m.W, m.H, x, y)) edge++;
+    }
+  }
+  return { fill, edge };
+}
+
+/**
+ * Partial Fisher-Yates: after this, points[0..K) is a uniform sample of the
+ * input and the array is truncated to K. Any prefix of the result is itself
+ * a uniform spatial sample, which the carousel's stride walk relies on.
+ */
+function uniformSample(points, maxPoints) {
+  const n = points.length;
+  const K = Math.min(n, maxPoints);
+  for (let i = 0; i < K; i++) {
+    const j = i + Math.floor(Math.random() * (n - i));
+    if (j !== i) {
+      const tmp = points[i];
+      points[i] = points[j];
+      points[j] = tmp;
+    }
+  }
+  points.length = K;
+  return points;
+}
+
+/**
+ * Emit normalized points from a mask. Normalizes against the filled bbox
+ * with the SAME denominator on both axes so aspect ratio is preserved.
+ */
+function emitMaskPoints(m, edgeOnly, maxPoints) {
+  const points = [];
+  if (m.maxX < m.minX || m.maxY < m.minY) return points;
+  const bboxW = m.maxX - m.minX + 1;
+  const bboxH = m.maxY - m.minY + 1;
   const denom = Math.max(bboxW, bboxH);
-
-  // Second pass: collect edge and interior points separately so we can
-  // detect "too simple" filled icons (solid blocks with no internal detail).
-  const edgePoints = [];
-  const interiorPoints = [];
-  for (let y = minY; y <= maxY; y++) {
-    for (let x = minX; x <= maxX; x++) {
-      if (!filled[y * W + x]) continue;
-
-      const nx = (x - minX) / denom;
-      const ny = (y - minY) / denom;
-
-      const isEdge =
-        x === 0 || x === W - 1 || y === 0 || y === H - 1 ||
-        !filled[(y - 1) * W + x] ||
-        !filled[(y + 1) * W + x] ||
-        !filled[y * W + (x - 1)] ||
-        !filled[y * W + (x + 1)];
-
-      if (isEdge) {
-        edgePoints.push({ x: nx, y: ny });
-      } else {
-        interiorPoints.push({ x: nx, y: ny });
-      }
-    }
-  }
-
-  // Detect "too simple" filled shapes: if edges are < 12% of total pixels,
-  // the shape is a solid blob with little internal structure. Drop interior
-  // points entirely and render edge-only so the silhouette outline is visible.
-  const totalPixels = edgePoints.length + interiorPoints.length;
-  const edgeRatio = totalPixels > 0 ? edgePoints.length / totalPixels : 1;
-  const edgeOnly = edgeRatio < 0.12;
-
-  if (edgeOnly && resolution <= 300) {
-    return rasterizeFromPaths(paths, viewBox, resolution * 2, shapeSource, maxPoints);
-  }
-
   const pixelSize = 1 / denom;
-  if (edgeOnly) {
-    for (const p of edgePoints) {
-      points.push({ x: p.x, y: p.y, edge: true });
-      points.push({ x: p.x + (Math.random() - 0.5) * pixelSize, y: p.y + (Math.random() - 0.5) * pixelSize, edge: true });
-      points.push({ x: p.x + (Math.random() - 0.5) * pixelSize, y: p.y + (Math.random() - 0.5) * pixelSize, edge: true });
-    }
-  } else {
-    for (const p of edgePoints) {
-      points.push({ x: p.x, y: p.y, edge: true });
-      points.push({ x: p.x, y: p.y, edge: true });
-      points.push({ x: p.x, y: p.y, edge: true });
-    }
-    for (const p of interiorPoints) {
-      points.push({ x: p.x, y: p.y, edge: false });
-    }
-  }
 
-  // Shuffle unconditionally so ANY prefix of the array is a uniform spatial
-  // sample. This is critical for the ferris wheel: each shape gets only
-  // budget/N particles, and _applyShapeRotation walks basePoints[0..slots].
-  // Without shuffling, those slots cover only the first scanlines (top of
-  // the shape) and the bottom half vanishes.
-  //
-  // When points.length > maxPoints, the shuffle doubles as a partial
-  // Fisher-Yates that selects a uniform K-sample and truncates.
-  {
-    const n = points.length;
-    const K = Math.min(n, maxPoints);
-    for (let i = 0; i < K; i++) {
-      const j = i + Math.floor(Math.random() * (n - i));
-      if (j !== i) {
-        const tmp = points[i];
-        points[i] = points[j];
-        points[j] = tmp;
+  for (let y = m.minY; y <= m.maxY; y++) {
+    for (let x = m.minX; x <= m.maxX; x++) {
+      if (!m.filled[y * m.W + x]) continue;
+      const nx = (x - m.minX) / denom;
+      const ny = (y - m.minY) / denom;
+      const isEdge = isEdgePixel(m.filled, m.W, m.H, x, y);
+      if (edgeOnly) {
+        if (!isEdge) continue;
+        points.push({ x: nx, y: ny, edge: true });
+        points.push({ x: nx + (Math.random() - 0.5) * pixelSize, y: ny + (Math.random() - 0.5) * pixelSize, edge: true });
+        points.push({ x: nx + (Math.random() - 0.5) * pixelSize, y: ny + (Math.random() - 0.5) * pixelSize, edge: true });
+      } else if (isEdge) {
+        points.push({ x: nx, y: ny, edge: true });
+        points.push({ x: nx, y: ny, edge: true });
+        points.push({ x: nx, y: ny, edge: true });
+      } else {
+        points.push({ x: nx, y: ny, edge: false });
       }
     }
-    points.length = K;
   }
 
+  uniformSample(points, maxPoints);
   points.aspectRatio = bboxW / bboxH;
   return points;
+}
+
+function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'library', maxPoints = 30000) {
+  let mask = buildFillMask(paths, viewBox, resolution, shapeSource);
+  if (mask.maxX < mask.minX || mask.maxY < mask.minY) return [];
+
+  const stats = maskStats(mask);
+  const edgeRatio = stats.fill > 0 ? stats.edge / stats.fill : 1;
+  const edgeOnly = edgeRatio < 0.12;
+
+  // Outline particles need the finer raster for density; the decision is
+  // already made, so the second render emits edge points only.
+  if (edgeOnly && resolution <= 300) {
+    mask = buildFillMask(paths, viewBox, resolution * 2, shapeSource);
+  }
+  return emitMaskPoints(mask, edgeOnly, maxPoints);
 }
 
 /**
@@ -644,6 +635,10 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
  * stroke. Perpendicular jitter gives the stroke "weight"; along-tangent
  * jitter breaks up the regularity of fixed-interval sampling.
  *
+ * Cost model: one getPointAtLength per sample (the tangent comes from the
+ * neighbouring samples), and every clone is attached before any measuring
+ * so the DOM lays the host out once, not once per element.
+ *
  * Same output contract as rasterizeFromPaths: points are {x, y} in
  * [0, 1] × [0, <=1] (aspect-preserving, longest axis = 1), with
  * `points.aspectRatio = bboxW / bboxH` attached.
@@ -656,7 +651,7 @@ function rasterizeFromPaths(paths, viewBox, resolution = 300, shapeSource = 'lib
  * @param {number} maxPoints — hard cap on returned particles.
  */
 export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, maxPoints = 30000) {
-  const [vx, vy, vw, vh] = viewBox.split(' ').map(Number);
+  const [vx, vy, vw, vh] = viewBox.split(/[\s,]+/).map(Number);
   // Uniform scale so the longest viewBox axis fills `resolution` — preserves
   // aspect ratio. Offsets center the content inside the square measurement box.
   const scale = resolution / Math.max(vw, vh);
@@ -684,33 +679,35 @@ export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, ma
   const alongJitterSvg = ALONG_JITTER_PX / scale;
 
   try {
+    const clones = [];
     for (const el of geomEls) {
       // Only sample elements that implement SVGGeometryElement.
       if (typeof el.getTotalLength !== 'function') continue;
-
       // Clone without children — we only need the element's geometry.
       const clone = el.cloneNode(false);
       host.appendChild(clone);
+      clones.push(clone);
+    }
 
+    for (const clone of clones) {
       let totalLen = 0;
       try {
         totalLen = clone.getTotalLength();
       } catch (_) { /* some browsers throw on degenerate geometry */ }
-      if (!Number.isFinite(totalLen) || totalLen <= 0) { host.removeChild(clone); continue; }
+      if (!Number.isFinite(totalLen) || totalLen <= 0) continue;
 
       const numSamples = Math.max(2, Math.ceil(totalLen / sampleStepSvg));
-      let prevNtx = 0, prevNty = 0;
-
+      const samples = new Array(numSamples);
       for (let i = 0; i < numSamples; i++) {
-        const t = (i / (numSamples - 1)) * totalLen;
-        const p = clone.getPointAtLength(t);
+        samples[i] = clone.getPointAtLength((i / (numSamples - 1)) * totalLen);
+      }
 
-        // Tangent via symmetric finite difference, clamped at ends.
-        const dt = Math.max(0.05, Math.min(sampleStepSvg * 0.5, totalLen * 0.5));
-        const tA = Math.max(0, t - dt);
-        const tB = Math.min(totalLen, t + dt);
-        const pA = clone.getPointAtLength(tA);
-        const pB = clone.getPointAtLength(tB);
+      let prevNtx = 0, prevNty = 0;
+      for (let i = 0; i < numSamples; i++) {
+        const p = samples[i];
+        // Tangent from the neighbouring samples, clamped at the ends.
+        const pA = samples[i > 0 ? i - 1 : 0];
+        const pB = samples[i < numSamples - 1 ? i + 1 : numSamples - 1];
         const tx = pB.x - pA.x, ty = pB.y - pA.y;
         const tLen = Math.hypot(tx, ty) || 1;
         const ntx = tx / tLen, nty = ty / tLen;
@@ -736,7 +733,6 @@ export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, ma
           points.push({ x: cx / resolution, y: cy / resolution, edge: true });
         }
       }
-      host.removeChild(clone);
     }
   } finally {
     document.body.removeChild(host);
@@ -759,17 +755,7 @@ export function particlesFromGeomElements(geomEls, viewBox, resolution = 300, ma
     p.y = (p.y - minY) / denom;
   }
 
-  // Shuffle unconditionally so any prefix is a uniform spatial sample
-  // (same rationale as rasterizeFromPaths — ferris wheel uses a prefix).
-  {
-    const K = Math.min(points.length, maxPoints), n = points.length;
-    for (let i = 0; i < K; i++) {
-      const j = i + Math.floor(Math.random() * (n - i));
-      if (j !== i) { const tmp = points[i]; points[i] = points[j]; points[j] = tmp; }
-    }
-    points.length = K;
-  }
-
+  uniformSample(points, maxPoints);
   points.aspectRatio = bboxW / (bboxH || 1);
   return points;
 }
@@ -879,7 +865,9 @@ export async function loadExternalShape(url, resolution = 300, maxPoints = 30000
     }
 
     const pathEls = doc.querySelectorAll('path');
-    const paths = Array.from(pathEls).map(p => p.getAttribute('d')).filter(Boolean);
+    const paths = Array.from(pathEls)
+      .map(p => ({ d: p.getAttribute('d'), fillRule: (p.getAttribute('fill-rule') || '').trim().toLowerCase() }))
+      .filter(p => p.d);
 
     if (paths.length === 0) return null;
 
@@ -939,7 +927,12 @@ export function rasterizeText(text, opts = {}) {
   measureCtx.font = font;
   if ('letterSpacing' in measureCtx) measureCtx.letterSpacing = letterSpacingCss;
   const metrics = measureCtx.measureText(text);
-  const textWidth = Math.ceil(metrics.width);
+  // Size the bitmap from the ink bounds, not the advance width: script
+  // faces overhang their advance (swashes on a leading "T", a trailing
+  // "s"), and anything outside the bitmap is silently lost.
+  const inkLeft = Number.isFinite(metrics.actualBoundingBoxLeft) ? Math.ceil(Math.max(0, metrics.actualBoundingBoxLeft)) : 0;
+  const inkRight = Number.isFinite(metrics.actualBoundingBoxRight) ? Math.ceil(Math.max(0, metrics.actualBoundingBoxRight)) : 0;
+  const textWidth = inkLeft + inkRight > 0 ? inkLeft + inkRight : Math.ceil(metrics.width);
   // Most browsers expose actualBoundingBox* in modern versions. Fall back
   // to a heuristic if missing.
   const ascent = metrics.actualBoundingBoxAscent || 56;
@@ -962,7 +955,7 @@ export function rasterizeText(text, opts = {}) {
   ctx.font = font;
   if ('letterSpacing' in ctx) ctx.letterSpacing = letterSpacingCss;
   ctx.textBaseline = 'alphabetic';
-  ctx.fillText(text, padding, padding + ascent);
+  ctx.fillText(text, padding + inkLeft, padding + ascent);
 
   // Scan pixels, collect filled positions, and normalize to [0,1] × [0,1].
   const imageData = ctx.getImageData(0, 0, bitmapW, bitmapH);

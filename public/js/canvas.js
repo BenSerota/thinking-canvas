@@ -61,6 +61,13 @@ const HURRICANE_LERP = 0.04;
 // → ~21s per full revolution. Slow enough to read the silhouette clearly.
 const SHAPE_ROTATION_SPEED = 0.005;
 
+// Motion-blur trail: fraction of the previous frame cleared per 60 fps frame.
+const TRAIL_CLEAR = 0.35;
+// Offscreen disc sprite (one per palette color) drawn scaled per particle —
+// far cheaper than a beginPath/arc/fill per particle.
+const SPRITE_SIZE = 32;
+const SPRITE_DISC_RADIUS = SPRITE_SIZE / 2 - 1;
+
 // Cursor interaction constants
 const CURSOR_RADIUS = 80;
 const CURSOR_REPEL_FORCE = 3.0;
@@ -109,6 +116,20 @@ export class ThinkingCanvas {
 
     this.time = 0;
     this.lastTimestamp = null;
+
+    // Per-frame timing factors. Every force, impulse and per-frame rate is
+    // tuned for 60 fps; dtF scales them so 120 Hz displays and throttled
+    // tabs play at the same real-time speed. Initialised to their dtF = 1
+    // values because _update/_render already run on the very first frame,
+    // before any dt exists.
+    this._dt = 1 / 60;
+    this._dtF = 1;
+    this._frictionF = FRICTION;
+    this._springDampF = SPRING_DAMPING;
+    this._hurricaneLerpF = HURRICANE_LERP;
+    this._trailClearF = TRAIL_CLEAR;
+
+    this._sprites = new Map();
 
     // Layout replay. `_layout` records the main content ({kind, args});
     // the thinking title is an overlay recorded separately because it
@@ -621,7 +642,7 @@ export class ThinkingCanvas {
       particleIndices: [],
       // Animation fields (null = static shape)
       animationFrames: null,
-      animationFps: 0,
+      animationDuration: 0,
       animationTime: 0,
       currentFrameIdx: 0,
     };
@@ -650,14 +671,27 @@ export class ThinkingCanvas {
     const gcx = (gMinX + gMaxX) / 2;
     const gcy = (gMinY + gMaxY) / 2;
 
-    shape.animationFrames = animOpts.frames.map(frame =>
-      frame.map(p => ({
-        x: centerX + (p.x - gcx) * scale,
-        y: centerY + (p.y - gcy) * scale,
-        edge: p.edge ?? false,
-      }))
-    );
-    shape.animationFps = Math.min(animOpts.fps || 5, 5);
+    // Canvas-space frames are cached on the descriptor per placement, so a
+    // crossfade tick that re-sets the same shape doesn't re-map 24 frames.
+    const cacheKey = `${centerX}|${centerY}|${scale}`;
+    if (!animOpts._frameCache || animOpts._frameCache.key !== cacheKey) {
+      animOpts._frameCache = {
+        key: cacheKey,
+        frames: animOpts.frames.map(frame =>
+          frame.map(p => ({
+            x: centerX + (p.x - gcx) * scale,
+            y: centerY + (p.y - gcy) * scale,
+            edge: p.edge ?? false,
+            hidden: p.hidden === true,
+          }))
+        ),
+      };
+    }
+    shape.animationFrames = animOpts._frameCache.frames;
+    const frameCount = animOpts.frames.length;
+    shape.animationDuration = animOpts.duration > 0
+      ? animOpts.duration
+      : frameCount / Math.min(animOpts.fps || 5, 5);
     shape.animationTime = 0;
     shape.currentFrameIdx = 0;
     shape.animationOriginX = centerX;
@@ -669,7 +703,7 @@ export class ThinkingCanvas {
     // which differs when dynamic elements (electrons) extend the global bbox
     // in other frames. Without this, static particles sit at _buildShape
     // positions while dynamic particles jump to _attachAnimation positions.
-    shape.basePoints = shape.animationFrames[0].map(p => ({ x: p.x, y: p.y, edge: p.edge ?? false }));
+    shape.basePoints = shape.animationFrames[0].map(p => ({ x: p.x, y: p.y, edge: p.edge ?? false, hidden: p.hidden === true }));
   }
 
   /**
@@ -806,6 +840,13 @@ export class ThinkingCanvas {
     if (this.lastTimestamp !== null) {
       const dt = Math.min((timestamp - this.lastTimestamp) / 1000, 0.05);
       this.time += dt;
+      const dtF = Math.min(dt * 60, 3);
+      this._dt = dt;
+      this._dtF = dtF;
+      this._frictionF = Math.pow(FRICTION, dtF);
+      this._springDampF = Math.pow(SPRING_DAMPING, dtF);
+      this._hurricaneLerpF = 1 - Math.pow(1 - HURRICANE_LERP, dtF);
+      this._trailClearF = 1 - Math.pow(1 - TRAIL_CLEAR, dtF);
     }
     this.lastTimestamp = timestamp;
 
@@ -888,7 +929,7 @@ export class ThinkingCanvas {
     const target = HURRICANE_TARGETS[this.state] != null
       ? HURRICANE_TARGETS[this.state]
       : HURRICANE_TARGETS['idle'];
-    this.hurricaneIntensity += (target - this.hurricaneIntensity) * HURRICANE_LERP;
+    this.hurricaneIntensity += (target - this.hurricaneIntensity) * this._hurricaneLerpF;
 
     // Rotate each shape's target positions. Done per-frame so shape
     // particles smoothly track the rotating silhouette via spring physics.
@@ -896,8 +937,10 @@ export class ThinkingCanvas {
 
     const cx = this.width / 2;
     const cy = this.height / 2;
-    const springK = SPRING_K;
-    const springDamp = SPRING_DAMPING;
+    const dtF = this._dtF;
+    const springK = SPRING_K * dtF;
+    const springDamp = this._springDampF;
+    const frictionF = this._frictionF;
     const intensity = this.hurricaneIntensity;
 
     // Target hurricane radius. The ring must ENCOMPASS whatever shapes
@@ -921,8 +964,8 @@ export class ThinkingCanvas {
     for (let i = 0; i < this.activeParticleCount; i++) {
       const p = this.particles[i];
       // Subtle ambient brownian
-      p.vx += (Math.random() - 0.5) * BROWNIAN * 0.2;
-      p.vy += (Math.random() - 0.5) * BROWNIAN * 0.2;
+      p.vx += (Math.random() - 0.5) * BROWNIAN * 0.2 * dtF;
+      p.vy += (Math.random() - 0.5) * BROWNIAN * 0.2 * dtF;
 
       // ─── Cursor interaction (all states) ───
       if (this.mouseX !== null) {
@@ -931,7 +974,7 @@ export class ThinkingCanvas {
         const mDist = Math.sqrt(mdx * mdx + mdy * mdy);
 
         if (mDist < CURSOR_RADIUS && mDist > 1) {
-          const force = (CURSOR_RADIUS - mDist) / CURSOR_RADIUS;
+          const force = (CURSOR_RADIUS - mDist) / CURSOR_RADIUS * dtF;
           if (this.mouseDown) {
             p.vx += (mdx / mDist) * force * force * CURSOR_REPEL_FORCE;
             p.vy += (mdy / mDist) * force * force * CURSOR_REPEL_FORCE;
@@ -964,7 +1007,7 @@ export class ThinkingCanvas {
 
         // Tangential force — inner particles orbit faster (hurricane eye)
         const speedMult = dist < 60 ? 2.0 : (dist < 150 ? 1.5 : 1.0);
-        const swirlStrength = SWIRL_SPEED * intensity * speedMult;
+        const swirlStrength = SWIRL_SPEED * intensity * speedMult * dtF;
         const modulation = 1 + Math.sin(this.time * 3 + p.phase) * 0.5;
         p.vx += Math.cos(angle + Math.PI / 2) * swirlStrength * modulation;
         p.vy += Math.sin(angle + Math.PI / 2) * swirlStrength * modulation;
@@ -972,38 +1015,38 @@ export class ThinkingCanvas {
         // Radial force — always pull toward target radius. Scaled by
         // intensity so idle breeze is loose, thinking vortex is tight.
         const radialError = dist - targetRadius;
-        const radialForce = radialError * 0.002 * (0.3 + intensity * 0.7);
+        const radialForce = radialError * 0.002 * (0.3 + intensity * 0.7) * dtF;
         p.vx -= (dx / (dist + 1)) * radialForce;
         p.vy -= (dy / (dist + 1)) * radialForce;
 
         // Extra gathering pull during gather state (distinct behavior
         // from the swirl — particles rush in before organizing).
         if (this.state === 'gathering') {
-          const pulse = 1 + Math.sin(this.time * 3) * 0.3;
+          const pulse = (1 + Math.sin(this.time * 3) * 0.3) * dtF;
           p.vx -= dx * GATHER_PULL * pulse;
           p.vy -= dy * GATHER_PULL * pulse;
         }
 
         // Light brownian so the swirl stays coherent at high intensity.
-        const browScale = 0.15 + (1 - intensity) * 0.3;
+        const browScale = (0.15 + (1 - intensity) * 0.3) * dtF;
         p.vx += (Math.random() - 0.5) * BROWNIAN * browScale;
         p.vy += (Math.random() - 0.5) * BROWNIAN * browScale;
 
         // Tiny gravity so low-intensity breeze particles don't fly off.
         if (intensity < 0.3) {
-          p.vy += GRAVITY * 0.1 * (1 - intensity / 0.3);
+          p.vy += GRAVITY * 0.1 * (1 - intensity / 0.3) * dtF;
         }
       }
 
       // Apply velocity with friction
-      p.vx *= FRICTION;
-      p.vy *= FRICTION;
-      p.x += p.vx;
-      p.y += p.vy;
+      p.vx *= frictionF;
+      p.vy *= frictionF;
+      p.x += p.vx * dtF;
+      p.y += p.vy * dtF;
 
       // Boundary soft bounce
       if (p.x < 0) { p.x = 0; p.vx = Math.abs(p.vx) * 0.5; }
-      if (p.x > this.width) { p.x = this.width; p.vx = -Math.abs(p.vx) * 0.5; }
+      if (p.x > this.width) { p.x = this.width - 1; p.vx = -Math.abs(p.vx) * 0.5; }
       if (p.y < 0) { p.y = 0; p.vy = Math.abs(p.vy) * 0.5; }
       if (p.y > this.height) { p.y = this.height - 1; p.vy = -Math.abs(p.vy) * 0.3; }
     }
@@ -1023,7 +1066,7 @@ export class ThinkingCanvas {
     // stays put.
     const inCarousel = this.state === 'settled' && this.currentShapes.length > 1;
     if (inCarousel) {
-      this.carouselAngle += SHAPE_ROTATION_SPEED;
+      this.carouselAngle += SHAPE_ROTATION_SPEED * this._dtF;
     }
 
     // During the crossfade scatter window, do NOT write targets.
@@ -1062,8 +1105,11 @@ export class ThinkingCanvas {
         }
 
         if (shape.animationFrames && shape.animationFrames.length > 1) {
-          shape.animationTime += 1 / 60;
-          const newIdx = Math.floor(shape.animationTime * shape.animationFps) % shape.animationFrames.length;
+          // Frame index follows the authored duration in real time, so a
+          // 2 s heartbeat and a 3 s helix each play at their own pace.
+          shape.animationTime += this._dt;
+          const dur = shape.animationDuration;
+          const newIdx = Math.floor(((shape.animationTime % dur) / dur) * shape.animationFrames.length);
           if (newIdx !== shape.currentFrameIdx) {
             shape.currentFrameIdx = newIdx;
             const ox = shape.centerX - (shape.animationOriginX || shape.centerX);
@@ -1074,6 +1120,7 @@ export class ThinkingCanvas {
               shape.basePoints[i].x = newFrame[i].x + ox;
               shape.basePoints[i].y = newFrame[i].y + oy;
               shape.basePoints[i].edge = newFrame[i].edge ?? false;
+              shape.basePoints[i].hidden = newFrame[i].hidden === true;
             }
           }
         }
@@ -1084,7 +1131,7 @@ export class ThinkingCanvas {
       let revealX = Infinity;
       if (shape.writeReveal) {
         const wr = shape.writeReveal;
-        wr.time += 1 / 60;
+        wr.time += this._dt;
         const t = Math.min(wr.time / wr.duration, 1);
         const ease = t * (2 - t);
         revealX = wr.minX + (wr.maxX - wr.minX) * ease;
@@ -1122,6 +1169,13 @@ export class ThinkingCanvas {
         const bpIdx = useStride ? Math.floor(k * stride) : (k % bpLen);
         const bp = shape.basePoints[bpIdx];
         const p = this.particles[pi];
+
+        if (bp.hidden) {
+          // Padding entry of a shorter animation frame — nothing to show.
+          p.targetX = null;
+          p.targetY = null;
+          continue;
+        }
 
         if (bp.seep) {
           // The seep cycle is evaluated for the particle that actually
@@ -1186,39 +1240,41 @@ export class ThinkingCanvas {
   _render() {
     const ctx = this.ctx;
 
-    // Clear with motion blur trail
+    // Clear with motion blur trail (frame-rate independent)
     ctx.fillStyle = BG_COLOR;
-    ctx.globalAlpha = 0.35;
+    ctx.globalAlpha = this._trailClearF;
     ctx.fillRect(0, 0, this.width, this.height);
     ctx.globalAlpha = 1;
 
+    // The sprite's disc is slightly smaller than its box; scale the box so
+    // the drawn disc has exactly the requested radius.
+    const k = SPRITE_SIZE / SPRITE_DISC_RADIUS;
+
     for (let i = 0; i < this.activeParticleCount; i++) {
       const p = this.particles[i];
-      ctx.fillStyle = p.color;
 
       if (p.targetX !== null && p.isShapeParticle) {
         const dx = p.targetX - p.x;
         const dy = p.targetY - p.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
+        const sprite = this._getSprite(p.color);
 
         if (dist < 5) {
           // Glow
+          const rg = GLOW_SIZE * k;
           ctx.globalAlpha = 0.15;
-          ctx.beginPath();
-          ctx.arc(Math.round(p.x), Math.round(p.y), GLOW_SIZE, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.drawImage(sprite, p.x - rg / 2, p.y - rg / 2, rg, rg);
           // Main
+          const rc = p.size * 0.8 * k;
           ctx.globalAlpha = 0.9;
-          ctx.beginPath();
-          ctx.arc(Math.round(p.x), Math.round(p.y), p.size * 0.8, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.drawImage(sprite, p.x - rc / 2, p.y - rc / 2, rc, rc);
         } else {
+          const rm = p.size * 0.7 * k;
           ctx.globalAlpha = 0.5 + Math.min(0.3, 10 / dist);
-          ctx.beginPath();
-          ctx.arc(Math.round(p.x), Math.round(p.y), p.size * 0.7, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.drawImage(sprite, p.x - rm / 2, p.y - rm / 2, rm, rm);
         }
       } else {
+        ctx.fillStyle = p.color;
         ctx.globalAlpha = 0.3 + Math.sin(this.time + p.phase) * 0.12;
         ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
       }
@@ -1231,7 +1287,7 @@ export class ThinkingCanvas {
     if (this.state === 'forming' || this.state === 'settled') {
       const shapes = this.currentShapes.filter(s => !s.isTitle);
       if (shapes.length > 0) {
-        this.transitionProgress = Math.min(1, this.transitionProgress + 0.008);
+        this.transitionProgress = Math.min(1, this.transitionProgress + 0.008 * this._dtF);
         if (this.transitionProgress > 0.5) {
           const alpha = (this.transitionProgress - 0.5) * 0.3;
           ctx.fillStyle = `rgba(200, 180, 160, ${alpha})`;
@@ -1256,6 +1312,23 @@ export class ThinkingCanvas {
         }
       }
     }
+  }
+
+  /** Lazily build the disc sprite for a palette color. */
+  _getSprite(color) {
+    let sprite = this._sprites.get(color);
+    if (!sprite) {
+      sprite = document.createElement('canvas');
+      sprite.width = SPRITE_SIZE;
+      sprite.height = SPRITE_SIZE;
+      const g = sprite.getContext('2d');
+      g.fillStyle = color;
+      g.beginPath();
+      g.arc(SPRITE_SIZE / 2, SPRITE_SIZE / 2, SPRITE_DISC_RADIUS, 0, Math.PI * 2);
+      g.fill();
+      this._sprites.set(color, sprite);
+    }
+    return sprite;
   }
 
   destroy() {

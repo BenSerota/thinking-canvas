@@ -234,7 +234,7 @@ class App {
     // (first frame for display) and _animated (full animation data if present).
     if (resolved.isAnimated) {
       shape._points = resolved.points;
-      shape._animated = { frames: resolved.frames, fps: resolved.fps, staticCount: resolved.staticCount || 0 };
+      shape._animated = { frames: resolved.frames, fps: resolved.fps, duration: resolved.duration, staticCount: resolved.staticCount || 0 };
     } else {
       shape._points = resolved;
       shape._animated = null;
@@ -365,6 +365,7 @@ class App {
           isAnimated: true,
           frames: result.frames,
           fps: result.fps,
+          duration: result.duration,
           points: result.frames[0],
           staticCount: result.staticCount || 0,
         };
