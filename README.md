@@ -1,6 +1,6 @@
 # Thinking Canvas
 
-An AI chat interface where 12,000 sand-grain particles form shapes that visualize Claude's thoughts in real time. As you talk, watch the canvas -- you'll see concepts take shape as particle silhouettes, animated Lottie figures, and flowing formations.
+An AI chat interface where 8,000 sand-grain particles form shapes that visualize what Claude is working on, in real time. As you talk, watch the canvas -- you'll see concepts take shape as particle silhouettes, animated Lottie figures, and flowing formations.
 
 ## How It Works
 
@@ -39,7 +39,7 @@ The icon library and emoji embeddings must be built before the first run:
 
 ```bash
 npm run setup-icons    # Downloads ~5,500 icons and builds embeddings (~60s)
-npm run setup-emoji    # Downloads OpenMoji SVGs and builds embeddings (~30s)
+npm run setup-emoji    # Builds the emoji embeddings index (~30s; the OpenMoji SVGs ship with the repo)
 ```
 
 Lottie animations are pre-built and tracked in git. To regenerate them:
@@ -85,3 +85,6 @@ scripts/               Build scripts for icons, emoji, and Lottie assets
 ## Licenses
 
 The code is MIT (see `LICENSE`). The shape assets are not: OpenMoji emoji are CC BY-SA 4.0, Font Awesome Free icons are CC BY 4.0, Material Symbols are Apache 2.0, and Iconify icons carry their own set's license (recorded in a sidecar JSON next to each cached file). See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for the full attributions, which must travel with any redistribution of `public/shapes/`.
+
+- Emoji silhouettes: [OpenMoji](https://openmoji.org) (CC BY-SA 4.0, HfG Schwäbisch Gmünd) — ~2,400 SVGs vendored in `public/shapes/emoji/`.
+- Animation playback: [lottie-web](https://github.com/airbnb/lottie-web) (MIT), vendored as `public/js/vendor/lottie_light.min.js`.
